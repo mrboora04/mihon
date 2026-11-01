@@ -38,11 +38,18 @@ class SuggestionsViewModel(
 
     fun refresh() {
         job?.cancel()
-        state.update { it.copy(isLoading = true, failed = false, progress = 0, progressTotal = 0) }
+        state.update { it.copy(isLoading = true, failed = false, items = emptyList(), progress = 0, progressTotal = 0) }
         job = viewModelScope.launch(Dispatchers.IO) {
             try {
-                val result = engine.generate { done, total ->
-                    state.update { it.copy(progress = done, progressTotal = total) }
+                // Each partial result replaces the list, so suggestions show up while slower sources load
+                val result = engine.generate { partial ->
+                    state.update {
+                        it.copy(
+                            items = partial.suggestions,
+                            progress = partial.checked,
+                            progressTotal = partial.total,
+                        )
+                    }
                 }
                 state.update {
                     it.copy(

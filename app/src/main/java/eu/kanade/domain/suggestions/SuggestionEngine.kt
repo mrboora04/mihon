@@ -10,6 +10,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import logcat.LogPriority
@@ -21,7 +23,6 @@ import tachiyomi.domain.manga.interactor.NetworkToLocalManga
 import tachiyomi.domain.manga.model.Manga
 import tachiyomi.domain.source.service.SourceManager
 import tachiyomi.source.local.isLocal
-import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Duration.Companion.seconds
 import eu.kanade.tachiyomi.source.model.SManga as SourceManga
 
@@ -43,9 +44,10 @@ class SuggestionEngine(
     private val dispatcher = Dispatchers.IO.limitedParallelism(5)
 
     /**
-     * @param onProgress called with (finished, total) source requests as they complete.
+     * Runs every source request and reports a ranked snapshot as results come in, so the list can
+     * be shown before the slowest source answers. The returned value is the final snapshot.
      */
-    suspend fun generate(onProgress: (Int, Int) -> Unit = { _, _ -> }): Result = coroutineScope {
+    suspend fun generate(onUpdate: (Result) -> Unit = {}): Result = coroutineScope {
         val signals = preferences.signals.get()
         val library = getLibraryManga.await()
         val seeds = buildSeeds(signals, library)
@@ -61,105 +63,151 @@ class SuggestionEngine(
             )
         }.orEmpty()
 
+        // Requests start roughly in this order, so the personal ones go first across every source,
+        // and popular/latest (not personal) last and only from the top sources.
         val requests = buildList {
-            sources.forEachIndexed { index, source ->
-                seeds.forEach { seed -> add(Request(source, seed)) }
-                statusSeeds.forEach { seed -> add(Request(source, seed)) }
-                // Popular and latest aren't personal, so only the sources at the top of the list
-                // (pinned, then last used) contribute them; otherwise they drown out the matches.
-                if (index < GENERIC_LISTING_SOURCES) {
-                    if (SuggestionSignal.POPULAR in signals) add(Request(source, Seed.Popular))
-                    if (SuggestionSignal.LATEST in signals && source.supportsLatest) add(Request(source, Seed.Latest))
+            seeds.forEach { seed -> sources.forEach { add(Request(it, seed)) } }
+            statusSeeds.forEach { seed -> sources.forEach { add(Request(it, seed)) } }
+            sources.take(GENERIC_LISTING_SOURCES).forEach { source ->
+                if (SuggestionSignal.POPULAR in signals) add(Request(source, Seed.Popular))
+                if (SuggestionSignal.LATEST in signals && source.supportsLatest) add(Request(source, Seed.Latest))
+            }
+        }
+
+        val ranking = Ranking(
+            library = library,
+            hideInLibrary = preferences.hideInLibrary.get(),
+            topGenres = seeds.filterIsInstance<Seed.Genre>().mapTo(HashSet()) { it.genre.lowercase() },
+            pinned = sourcePreferences.pinnedSources.get(),
+        )
+        val mutex = Mutex()
+        var finished = 0
+        var lastUpdate = 0L
+
+        suspend fun snapshot() = Result(
+            suggestions = ranking.suggestions(),
+            seeds = seeds,
+            sourceCount = sources.size,
+            checked = finished,
+            total = requests.size,
+        )
+
+        onUpdate(Result(emptyList(), seeds, sources.size, checked = 0, total = requests.size))
+        requests.map { request ->
+            async {
+                val page = fetch(request)
+                mutex.withLock {
+                    ranking.add(request, page)
+                    finished++
+                    val now = System.currentTimeMillis()
+                    if (now - lastUpdate >= UPDATE_INTERVAL_MS) {
+                        lastUpdate = now
+                        onUpdate(snapshot())
+                    }
+                }
+            }
+        }.awaitAll()
+
+        val threshold = preferences.shortThreshold.get()
+        if (threshold > 0) {
+            ranking.ranked().take(LENGTH_CHECK_LIMIT).map { candidate ->
+                async { candidate to chapterCount(candidate) }
+            }.awaitAll().forEach { (candidate, count) ->
+                candidate.lengthTag = when {
+                    count == null || count == 0 -> null
+                    count <= threshold -> SuggestionTag.ShortSeries
+                    count >= threshold * 4 -> SuggestionTag.LongSeries
+                    else -> null
                 }
             }
         }
 
-        val finished = AtomicInteger(0)
-        onProgress(0, requests.size)
-        val pages = requests.map { request ->
-            async {
-                val page = fetch(request)
-                onProgress(finished.incrementAndGet(), requests.size)
-                request to page
-            }
-        }.awaitAll()
+        snapshot().also(onUpdate)
+    }
 
-        val libraryKeys = library.mapTo(HashSet()) { it.manga.source to it.manga.url }
-        val libraryTitles = library.mapTo(HashSet()) { it.manga.title.normalized() }
-        val hideInLibrary = preferences.hideInLibrary.get()
-        val topGenres = seeds.filterIsInstance<Seed.Genre>().mapTo(HashSet()) { it.genre.lowercase() }
-        val pinned = sourcePreferences.pinnedSources.get()
+    /**
+     * Collects results as they arrive. Tags that depend on everything seen so far (genre overlap,
+     * found in more than one source) are worked out fresh on every snapshot rather than stored.
+     */
+    private inner class Ranking(
+        library: List<LibraryManga>,
+        private val hideInLibrary: Boolean,
+        private val topGenres: Set<String>,
+        private val pinned: Set<String>,
+    ) {
+        private val libraryKeys = library.mapTo(HashSet()) { it.manga.source to it.manga.url }
+        private val libraryTitles = library.mapTo(HashSet()) { it.manga.title.normalized() }
+        private val candidates = LinkedHashMap<Pair<Long, String>, Candidate>()
+        private val sourcesByTitle = HashMap<String, MutableSet<Long>>()
+        private val localManga = HashMap<Pair<Long, String>, Manga>()
 
-        val candidates = LinkedHashMap<Pair<Long, String>, Candidate>()
-        val sourcesByTitle = HashMap<String, MutableSet<Long>>()
-
-        for ((request, page) in pages) {
+        fun add(request: Request, page: MangasPage?) {
             page?.mangas?.forEach { sManga ->
                 val key = request.source.id to sManga.url
                 if (hideInLibrary && (key in libraryKeys || sManga.title.normalized() in libraryTitles)) {
                     return@forEach
                 }
                 val candidate = candidates.getOrPut(key) { Candidate(request.source, sManga) }
-                candidate.tags += request.seed.tags
-                candidate.score += request.seed.weight
+                candidate.seedTags += request.seed.tags
+                candidate.seedScore += request.seed.weight
                 sourcesByTitle.getOrPut(sManga.title.normalized()) { HashSet() } += request.source.id
             }
         }
 
-        val ranked = candidates.values
-            .onEach { candidate ->
-                val domain = candidate.sManga.toDomainManga(candidate.source.id)
-                domain.genre.orEmpty()
-                    .filter { it.lowercase() in topGenres }
-                    .forEach {
-                        candidate.tags += SuggestionTag.Genre(it)
-                        candidate.score += 1
-                    }
-                if ((sourcesByTitle[candidate.sManga.title.normalized()]?.size ?: 0) > 1) {
-                    candidate.tags += SuggestionTag.MultiSource
-                    candidate.score += 1
-                }
-                when (domain.status.toInt()) {
-                    SourceManga.COMPLETED, SourceManga.PUBLISHING_FINISHED -> candidate.tags += SuggestionTag.Completed
-                    SourceManga.ONGOING -> candidate.tags += SuggestionTag.Ongoing
-                }
-                // Every suggestion carries at least two reasons; the source it came from is always a true one.
-                if (candidate.tags.size < 2) {
-                    candidate.tags += if ("${candidate.source.id}" in pinned) {
-                        SuggestionTag.PinnedSource
-                    } else {
-                        SuggestionTag.FromSource(candidate.source.name)
-                    }
-                }
-            }
-            .sortedWith(compareByDescending<Candidate> { it.score }.thenByDescending { it.tags.size })
-            .distinctBy { it.sManga.title.normalized() }
-            .take(MAX_RESULTS)
+        fun ranked(): List<Candidate> {
+            return candidates.values
+                .onEach(::scoreCandidate)
+                .sortedWith(compareByDescending<Candidate> { it.score }.thenByDescending { it.tags.size })
+                .distinctBy { it.sManga.title.normalized() }
+                .take(MAX_RESULTS)
+        }
 
-        val threshold = preferences.shortThreshold.get()
-        if (threshold > 0) {
-            ranked.take(LENGTH_CHECK_LIMIT).map { candidate ->
-                async { candidate to chapterCount(candidate) }
-            }.awaitAll().forEach { (candidate, count) ->
-                when {
-                    count == null || count == 0 -> {}
-                    count <= threshold -> candidate.tags += SuggestionTag.ShortSeries
-                    count >= threshold * 4 -> candidate.tags += SuggestionTag.LongSeries
-                }
+        suspend fun suggestions(): List<Suggestion> {
+            val ranked = ranked()
+            val missing = ranked.filter { it.key !in localManga }
+            if (missing.isNotEmpty()) {
+                networkToLocalManga(missing.map { it.sManga.toDomainManga(it.source.id) })
+                    .forEachIndexed { index, manga -> localManga[missing[index].key] = manga }
+            }
+            return ranked.map { candidate ->
+                Suggestion(
+                    manga = localManga.getValue(candidate.key),
+                    sourceName = candidate.source.name,
+                    tags = candidate.tags.sortedBy { it.order },
+                    score = candidate.score,
+                )
             }
         }
 
-        val localManga = networkToLocalManga(ranked.map { it.sManga.toDomainManga(it.source.id) })
-        val suggestions = ranked.zip(localManga) { candidate, manga ->
-            Suggestion(
-                manga = manga,
-                sourceName = candidate.source.name,
-                tags = candidate.tags.sortedBy { it.order },
-                score = candidate.score,
-            )
+        private fun scoreCandidate(candidate: Candidate) {
+            val tags = LinkedHashSet(candidate.seedTags)
+            var score = candidate.seedScore
+            val domain = candidate.sManga.toDomainManga(candidate.source.id)
+            domain.genre.orEmpty()
+                .filter { it.lowercase() in topGenres }
+                .forEach {
+                    if (tags.add(SuggestionTag.Genre(it))) score += 1
+                }
+            if ((sourcesByTitle[candidate.sManga.title.normalized()]?.size ?: 0) > 1) {
+                tags += SuggestionTag.MultiSource
+                score += 1
+            }
+            when (domain.status.toInt()) {
+                SourceManga.COMPLETED, SourceManga.PUBLISHING_FINISHED -> tags += SuggestionTag.Completed
+                SourceManga.ONGOING -> tags += SuggestionTag.Ongoing
+            }
+            candidate.lengthTag?.let { tags += it }
+            // Every suggestion carries at least two reasons; the source it came from is always a true one.
+            if (tags.size < 2) {
+                tags += if ("${candidate.source.id}" in pinned) {
+                    SuggestionTag.PinnedSource
+                } else {
+                    SuggestionTag.FromSource(candidate.source.name)
+                }
+            }
+            candidate.tags = tags
+            candidate.score = score
         }
-
-        Result(suggestions, seeds, sourceCount = sources.size)
     }
 
     private fun buildSeeds(signals: Set<SuggestionSignal>, library: List<LibraryManga>): List<Seed> {
@@ -291,6 +339,8 @@ class SuggestionEngine(
         val suggestions: List<Suggestion>,
         val seeds: List<Seed>,
         val sourceCount: Int,
+        val checked: Int = 0,
+        val total: Int = 0,
     )
 
     sealed interface Seed {
@@ -322,7 +372,13 @@ class SuggestionEngine(
     private data class Request(val source: Source, val seed: Seed)
 
     private class Candidate(val source: Source, val sManga: SourceManga) {
-        val tags = LinkedHashSet<SuggestionTag>()
+        val key = source.id to sManga.url
+        val seedTags = LinkedHashSet<SuggestionTag>()
+        var seedScore = 0
+        var lengthTag: SuggestionTag? = null
+
+        // Recomputed by Ranking on every snapshot
+        var tags: Set<SuggestionTag> = emptySet()
         var score = 0
     }
 
@@ -334,7 +390,8 @@ class SuggestionEngine(
         private const val MAX_AUTHOR_SEEDS = 2
         private const val LENGTH_CHECK_LIMIT = 20
         private const val GENERIC_LISTING_SOURCES = 3
-        private val REQUEST_TIMEOUT = 20.seconds
+        private val REQUEST_TIMEOUT = 15.seconds
+        private const val UPDATE_INTERVAL_MS = 400L
         private const val STATUS_COMPLETED = "Completed"
         private const val STATUS_ONGOING = "Ongoing"
     }

@@ -12,8 +12,10 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -51,7 +53,7 @@ fun SuggestionsScreen(
     onOpenSettings: () -> Unit,
 ) {
     when {
-        state.isLoading -> LoadingProgress(state = state, contentPadding = contentPadding)
+        state.isLoading && state.items.isEmpty() -> LoadingProgress(state = state, contentPadding = contentPadding)
         state.items.isEmpty() -> EmptyScreen(
             stringRes = when {
                 state.failed -> MR.strings.suggestions_failed
@@ -67,7 +69,15 @@ fun SuggestionsScreen(
         )
         else -> ScrollbarLazyColumn(contentPadding = contentPadding) {
             item(key = "tags") {
-                TagFilterRow(state = state, onClickTag = onClickTag)
+                Column {
+                    if (state.isLoading && state.progressTotal > 0) {
+                        LinearProgressIndicator(
+                            progress = { state.progress / state.progressTotal.toFloat() },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    TagFilterRow(state = state, onClickTag = onClickTag)
+                }
             }
             items(items = state.visibleItems, key = { "${it.manga.source}-${it.manga.url}" }) { suggestion ->
                 SuggestionItem(
@@ -77,7 +87,34 @@ fun SuggestionsScreen(
                     onClickTag = onClickTag,
                 )
             }
+            if (state.isLoading) {
+                item(key = "loading") {
+                    LoadingMoreItem(state = state)
+                }
+            }
         }
+    }
+}
+
+/** Shown under the list while slower sources are still answering. */
+@Composable
+private fun LoadingMoreItem(state: SuggestionsViewModel.State) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(MaterialTheme.padding.medium),
+        horizontalArrangement = Arrangement.spacedBy(MaterialTheme.padding.medium, Alignment.CenterHorizontally),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        CircularProgressIndicator(
+            modifier = Modifier.size(20.dp),
+            strokeWidth = 2.dp,
+        )
+        Text(
+            text = stringResource(MR.strings.suggestions_progress, state.progress, state.progressTotal),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 

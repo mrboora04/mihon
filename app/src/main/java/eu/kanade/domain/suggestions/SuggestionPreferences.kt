@@ -23,15 +23,13 @@ class SuggestionPreferences(
         SuggestionSignal.entries.toSet(),
     )
 
-    val maxSources: Preference<Int> = preferenceStore.getInt("suggestions_max_sources", 5)
-
+    /** When false, every enabled source is checked (pinned first). */
     val pinnedSourcesOnly: Preference<Boolean> = preferenceStore.getBoolean("suggestions_pinned_only", false)
 
     val hideInLibrary: Preference<Boolean> = preferenceStore.getBoolean("suggestions_hide_in_library", true)
 
-    val checkLength: Preference<Boolean> = preferenceStore.getBoolean("suggestions_check_length", false)
-
-    val shortThreshold: Preference<Int> = preferenceStore.getInt("suggestions_short_threshold", 30)
+    /** Chapters at or below this count are tagged #short. 0 turns length tags off. */
+    val shortThreshold: Preference<Int> = preferenceStore.getInt("suggestions_short_chapters", 0)
 
     val recordSearches: Preference<Boolean> = preferenceStore.getBoolean("suggestions_record_searches", true)
 

@@ -8,11 +8,14 @@ import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -48,7 +51,7 @@ fun SuggestionsScreen(
     onOpenSettings: () -> Unit,
 ) {
     when {
-        state.isLoading -> LoadingScreen(Modifier.padding(contentPadding))
+        state.isLoading -> LoadingProgress(state = state, contentPadding = contentPadding)
         state.items.isEmpty() -> EmptyScreen(
             stringRes = when {
                 state.failed -> MR.strings.suggestions_failed
@@ -75,6 +78,35 @@ fun SuggestionsScreen(
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun LoadingProgress(
+    state: SuggestionsViewModel.State,
+    contentPadding: PaddingValues,
+) {
+    if (state.progressTotal == 0) {
+        LoadingScreen(Modifier.padding(contentPadding))
+        return
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(contentPadding)
+            .padding(horizontal = MaterialTheme.padding.large),
+        verticalArrangement = Arrangement.spacedBy(MaterialTheme.padding.medium, Alignment.CenterVertically),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        LinearProgressIndicator(
+            progress = { state.progress / state.progressTotal.toFloat() },
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Text(
+            text = stringResource(MR.strings.suggestions_progress, state.progress, state.progressTotal),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 

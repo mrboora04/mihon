@@ -26,7 +26,6 @@ object SettingsPersonalisedScreen : SearchableSettings {
         val preferences = remember { context.appGraph.suggestionPreferences }
 
         val enabled by preferences.enabled.collectAsState()
-        val checkLength by preferences.checkLength.collectAsState()
         val recentSearches by preferences.recentSearches.collectAsState()
         val searchCount = remember(recentSearches) { preferences.getRecentSearches().size }
 
@@ -50,6 +49,11 @@ object SettingsPersonalisedScreen : SearchableSettings {
                             SuggestionSignal.LATEST to stringResource(MR.strings.suggestion_signal_latest),
                         ),
                         title = stringResource(MR.strings.pref_suggestions_signals),
+                        // Keep the summary in the same order as the dialog, not the stored set's order
+                        subtitleProvider = { value, entries ->
+                            entries.filterKeys { it in value }.values.joinToString()
+                                .ifBlank { stringResource(MR.strings.none) }
+                        },
                         visible = enabled,
                     ),
                     Preference.PreferenceItem.InfoPreference(
@@ -61,15 +65,10 @@ object SettingsPersonalisedScreen : SearchableSettings {
                 title = stringResource(MR.strings.label_sources),
                 visible = enabled,
                 preferenceItems = listOf(
-                    Preference.PreferenceItem.SliderPreference(
-                        preference = preferences.maxSources,
-                        title = stringResource(MR.strings.pref_suggestions_max_sources),
-                        subtitle = stringResource(MR.strings.pref_suggestions_max_sources_summary),
-                        valueRange = 1..15,
-                    ),
                     Preference.PreferenceItem.SwitchPreference(
                         preference = preferences.pinnedSourcesOnly,
                         title = stringResource(MR.strings.pref_suggestions_pinned_only),
+                        subtitle = stringResource(MR.strings.pref_suggestions_pinned_only_summary),
                     ),
                     Preference.PreferenceItem.SwitchPreference(
                         preference = preferences.hideInLibrary,
@@ -81,17 +80,18 @@ object SettingsPersonalisedScreen : SearchableSettings {
                 title = stringResource(MR.strings.pref_suggestions_length),
                 visible = enabled,
                 preferenceItems = listOf(
-                    Preference.PreferenceItem.SwitchPreference(
-                        preference = preferences.checkLength,
-                        title = stringResource(MR.strings.pref_suggestions_check_length),
-                        subtitle = stringResource(MR.strings.pref_suggestions_check_length_summary),
-                    ),
                     Preference.PreferenceItem.SliderPreference(
                         preference = preferences.shortThreshold,
                         title = stringResource(MR.strings.pref_suggestions_short_threshold),
-                        valueText = { pluralStringResource(MR.plurals.manga_num_chapters, it, it) },
-                        valueRange = 10..100 step 10,
-                        visible = checkLength,
+                        subtitle = stringResource(MR.strings.pref_suggestions_short_threshold_summary),
+                        valueText = {
+                            if (it == 0) {
+                                stringResource(MR.strings.off)
+                            } else {
+                                pluralStringResource(MR.plurals.manga_num_chapters, it, it)
+                            }
+                        },
+                        valueRange = 0..100 step 10,
                     ),
                 ),
             ),

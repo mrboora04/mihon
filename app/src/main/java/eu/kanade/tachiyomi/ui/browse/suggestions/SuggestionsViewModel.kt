@@ -38,10 +38,12 @@ class SuggestionsViewModel(
 
     fun refresh() {
         job?.cancel()
-        state.update { it.copy(isLoading = true, failed = false) }
+        state.update { it.copy(isLoading = true, failed = false, progress = 0, progressTotal = 0) }
         job = viewModelScope.launch(Dispatchers.IO) {
             try {
-                val result = engine.generate()
+                val result = engine.generate { done, total ->
+                    state.update { it.copy(progress = done, progressTotal = total) }
+                }
                 state.update {
                     it.copy(
                         isLoading = false,
@@ -66,6 +68,8 @@ class SuggestionsViewModel(
     @Immutable
     data class State(
         val isLoading: Boolean = true,
+        val progress: Int = 0,
+        val progressTotal: Int = 0,
         val failed: Boolean = false,
         val items: List<Suggestion> = emptyList(),
         val hasSeeds: Boolean = false,

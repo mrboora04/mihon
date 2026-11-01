@@ -21,6 +21,7 @@ import tachiyomi.domain.manga.interactor.NetworkToLocalManga
 import tachiyomi.domain.manga.model.Manga
 import tachiyomi.domain.source.service.SourceManager
 import tachiyomi.source.local.isLocal
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Duration.Companion.seconds
 import eu.kanade.tachiyomi.source.model.SManga as SourceManga
 
@@ -41,7 +42,10 @@ class SuggestionEngine(
 
     private val dispatcher = Dispatchers.IO.limitedParallelism(5)
 
-    suspend fun generate(): Result = coroutineScope {
+    /**
+     * @param onProgress called with (finished, total) source requests as they complete.
+     */
+    suspend fun generate(onProgress: (Int, Int) -> Unit = { _, _ -> }): Result = coroutineScope {
         val signals = preferences.signals.get()
         val library = getLibraryManga.await()
         val seeds = buildSeeds(signals, library)
@@ -58,16 +62,26 @@ class SuggestionEngine(
         }.orEmpty()
 
         val requests = buildList {
-            sources.forEach { source ->
+            sources.forEachIndexed { index, source ->
                 seeds.forEach { seed -> add(Request(source, seed)) }
                 statusSeeds.forEach { seed -> add(Request(source, seed)) }
-                if (SuggestionSignal.POPULAR in signals) add(Request(source, Seed.Popular))
-                if (SuggestionSignal.LATEST in signals && source.supportsLatest) add(Request(source, Seed.Latest))
+                // Popular and latest aren't personal, so only the sources at the top of the list
+                // (pinned, then last used) contribute them; otherwise they drown out the matches.
+                if (index < GENERIC_LISTING_SOURCES) {
+                    if (SuggestionSignal.POPULAR in signals) add(Request(source, Seed.Popular))
+                    if (SuggestionSignal.LATEST in signals && source.supportsLatest) add(Request(source, Seed.Latest))
+                }
             }
         }
 
+        val finished = AtomicInteger(0)
+        onProgress(0, requests.size)
         val pages = requests.map { request ->
-            async { request to fetch(request) }
+            async {
+                val page = fetch(request)
+                onProgress(finished.incrementAndGet(), requests.size)
+                request to page
+            }
         }.awaitAll()
 
         val libraryKeys = library.mapTo(HashSet()) { it.manga.source to it.manga.url }
@@ -122,8 +136,8 @@ class SuggestionEngine(
             .distinctBy { it.sManga.title.normalized() }
             .take(MAX_RESULTS)
 
-        if (preferences.checkLength.get()) {
-            val threshold = preferences.shortThreshold.get()
+        val threshold = preferences.shortThreshold.get()
+        if (threshold > 0) {
             ranked.take(LENGTH_CHECK_LIMIT).map { candidate ->
                 async { candidate to chapterCount(candidate) }
             }.awaitAll().forEach { (candidate, count) ->
@@ -193,7 +207,7 @@ class SuggestionEngine(
         val disabledSources = sourcePreferences.disabledSources.get()
         val pinned = sourcePreferences.pinnedSources.get()
         val lastUsed = sourcePreferences.lastUsedSource.get()
-        val pinnedOnly = preferences.pinnedSourcesOnly.get()
+        val pinnedOnly = preferences.pinnedSourcesOnly.get() && pinned.isNotEmpty()
 
         return sourceManager.getAll()
             .filter { !it.isLocal() && it.lang in enabledLanguages && "${it.id}" !in disabledSources }
@@ -205,7 +219,6 @@ class SuggestionEngine(
                     { it.name.lowercase() },
                 ),
             )
-            .take(preferences.maxSources.get().coerceAtLeast(1))
     }
 
     private suspend fun fetch(request: Request): MangasPage? {
@@ -320,6 +333,7 @@ class SuggestionEngine(
         private const val MAX_GENRE_SEEDS = 3
         private const val MAX_AUTHOR_SEEDS = 2
         private const val LENGTH_CHECK_LIMIT = 20
+        private const val GENERIC_LISTING_SOURCES = 3
         private val REQUEST_TIMEOUT = 20.seconds
         private const val STATUS_COMPLETED = "Completed"
         private const val STATUS_ONGOING = "Ongoing"

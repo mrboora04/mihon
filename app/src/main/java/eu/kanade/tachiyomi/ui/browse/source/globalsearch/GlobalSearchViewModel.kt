@@ -7,7 +7,9 @@ import dev.zacsweers.metro.AssistedInject
 import dev.zacsweers.metro.ContributesIntoMap
 import dev.zacsweers.metrox.viewmodel.ManualViewModelAssistedFactory
 import dev.zacsweers.metrox.viewmodel.ManualViewModelAssistedFactoryKey
+import eu.kanade.domain.base.BasePreferences
 import eu.kanade.domain.source.service.SourcePreferences
+import eu.kanade.domain.suggestions.SuggestionPreferences
 import eu.kanade.tachiyomi.extension.ExtensionManager
 import eu.kanade.tachiyomi.source.Source
 import tachiyomi.domain.manga.interactor.GetManga
@@ -24,6 +26,8 @@ class GlobalSearchViewModel(
     networkToLocalManga: NetworkToLocalManga,
     getManga: GetManga,
     preferences: SourcePreferences,
+    private val basePreferences: BasePreferences,
+    private val suggestionPreferences: SuggestionPreferences,
 ) : SearchViewModel(
     initialState = State(searchQuery = initialQuery),
     sourcePreferences = sourcePreferences,
@@ -50,6 +54,10 @@ class GlobalSearchViewModel(
             }
             search()
         }
+    }
+
+    override fun onNewQuery(query: String) {
+        if (!basePreferences.incognitoMode.get()) suggestionPreferences.recordSearch(query)
     }
 
     override suspend fun getEnabledSources(): List<Source> {

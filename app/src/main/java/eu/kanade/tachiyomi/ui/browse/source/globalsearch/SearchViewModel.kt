@@ -111,6 +111,9 @@ abstract class SearchViewModel(
             .filter { it in enabledSources }
     }
 
+    /** Called once per distinct query that is actually searched. */
+    protected open fun onNewQuery(query: String) {}
+
     fun updateSearchQuery(query: String?) {
         state.update { it.copy(searchQuery = query) }
     }
@@ -135,6 +138,8 @@ abstract class SearchViewModel(
 
         this.lastQuery = query
         this.lastSourceFilter = sourceFilter
+
+        if (!sameQuery) onNewQuery(query)
 
         searchJob?.cancel()
 

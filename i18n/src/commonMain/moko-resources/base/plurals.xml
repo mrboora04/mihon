@@ -114,4 +114,8 @@
         <item quantity="one">%1$d update failed</item>
         <item quantity="other">%1$d updates failed</item>
     </plurals>
+    <plurals name="suggestions_saved_searches">
+        <item quantity="one">%1$d saved search</item>
+        <item quantity="other">%1$d saved searches</item>
+    </plurals>
 </resources>

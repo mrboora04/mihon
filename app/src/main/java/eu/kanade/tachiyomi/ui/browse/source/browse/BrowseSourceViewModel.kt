@@ -24,6 +24,8 @@ import eu.kanade.core.preference.asState
 import eu.kanade.domain.manga.interactor.UpdateManga
 import eu.kanade.domain.source.interactor.GetIncognitoState
 import eu.kanade.domain.source.service.SourcePreferences
+import eu.kanade.domain.suggestions.SuggestionPreferences
+import eu.kanade.domain.suggestions.applyGenre
 import eu.kanade.domain.track.interactor.AddTracks
 import eu.kanade.tachiyomi.data.cache.CoverCache
 import eu.kanade.tachiyomi.source.Source
@@ -80,6 +82,7 @@ class BrowseSourceViewModel(
     private val updateManga: UpdateManga,
     private val addTracks: AddTracks,
     getIncognitoState: GetIncognitoState,
+    private val suggestionPreferences: SuggestionPreferences,
 ) : ViewModel() {
 
     val state: StateFlow<BrowseSourceViewModel.State>
@@ -95,6 +98,9 @@ class BrowseSourceViewModel(
     var displayMode by sourcePreferences.sourceDisplayMode.asState(viewModelScope)
 
     private val source: Source? get() = state.value.source
+
+    // Searches aren't remembered for suggestions until we know this source isn't incognito
+    private var incognitoMode = true
 
     init {
         viewModelScope.launch(Dispatchers.IO) {
@@ -117,7 +123,8 @@ class BrowseSourceViewModel(
                 )
             }
 
-            if (!getIncognitoState.await(source.id)) {
+            incognitoMode = getIncognitoState.await(source.id)
+            if (!incognitoMode) {
                 sourcePreferences.lastUsedSource.set(source.id)
             }
         }
@@ -174,6 +181,8 @@ class BrowseSourceViewModel(
     }
 
     fun search(query: String? = null, filters: FilterList? = null) {
+        if (!incognitoMode) suggestionPreferences.recordSearch(query)
+
         val input = state.value.listing as? Listing.Search
             ?: Listing.Search(query = null, filters = source?.getFilterList() ?: FilterList())
 
@@ -190,32 +199,7 @@ class BrowseSourceViewModel(
 
     fun searchGenre(genreName: String) {
         val defaultFilters = source?.getFilterList() ?: return
-        var genreExists = false
-
-        filter@ for (sourceFilter in defaultFilters) {
-            if (sourceFilter is SourceModelFilter.Group<*>) {
-                for (filter in sourceFilter.state) {
-                    if (filter is SourceModelFilter<*> && filter.name.equals(genreName, true)) {
-                        when (filter) {
-                            is SourceModelFilter.TriState -> filter.state = 1
-                            is SourceModelFilter.CheckBox -> filter.state = true
-                            else -> {}
-                        }
-                        genreExists = true
-                        break@filter
-                    }
-                }
-            } else if (sourceFilter is SourceModelFilter.Select<*>) {
-                val index = sourceFilter.values.filterIsInstance<String>()
-                    .indexOfFirst { it.equals(genreName, true) }
-
-                if (index != -1) {
-                    sourceFilter.state = index
-                    genreExists = true
-                    break
-                }
-            }
-        }
+        val genreExists = defaultFilters.applyGenre(genreName)
 
         state.update {
             val listing = if (genreExists) {

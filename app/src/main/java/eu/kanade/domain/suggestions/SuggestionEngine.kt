@@ -49,9 +49,18 @@ class SuggestionEngine(
 
         if (sources.isEmpty()) return@coroutineScope Result(emptyList(), seeds, sourceCount = 0)
 
+        // Status only comes from the source's own Status filter; list pages rarely carry it.
+        val statusSeeds = seeds.filterIsInstance<Seed.Genre>().firstOrNull()?.let { top ->
+            listOf(
+                top.copy(tags = top.tags + SuggestionTag.Completed, weight = 1, status = STATUS_COMPLETED),
+                top.copy(tags = top.tags + SuggestionTag.Ongoing, weight = 1, status = STATUS_ONGOING),
+            )
+        }.orEmpty()
+
         val requests = buildList {
             sources.forEach { source ->
                 seeds.forEach { seed -> add(Request(source, seed)) }
+                statusSeeds.forEach { seed -> add(Request(source, seed)) }
                 if (SuggestionSignal.POPULAR in signals) add(Request(source, Seed.Popular))
                 if (SuggestionSignal.LATEST in signals && source.supportsLatest) add(Request(source, Seed.Latest))
             }
@@ -211,6 +220,8 @@ class SuggestionEngine(
                         is Seed.Genre -> {
                             // Same genre matching the Browse screen uses when you tap a genre tag
                             val filters = source.getFilterList()
+                            // No Status filter on this source: skip rather than guess
+                            if (seed.status != null && !filters.applyStatus(seed.status)) return@withContext null
                             if (filters.applyGenre(seed.genre)) {
                                 source.getSearchManga(1, "", filters)
                             } else {
@@ -281,6 +292,7 @@ class SuggestionEngine(
             val genre: String,
             override val tags: List<SuggestionTag>,
             override val weight: Int,
+            val status: String? = null,
         ) : Seed
 
         data object Popular : Seed {
@@ -309,6 +321,8 @@ class SuggestionEngine(
         private const val MAX_AUTHOR_SEEDS = 2
         private const val LENGTH_CHECK_LIMIT = 20
         private val REQUEST_TIMEOUT = 20.seconds
+        private const val STATUS_COMPLETED = "Completed"
+        private const val STATUS_ONGOING = "Ongoing"
     }
 }
 
@@ -358,6 +372,35 @@ fun FilterList.applyGenre(genreName: String): Boolean {
             val index = sourceFilter.values.filterIsInstance<String>()
                 .indexOfFirst { it.equals(genreName, true) }
 
+            if (index != -1) {
+                sourceFilter.state = index
+                return true
+            }
+        }
+    }
+    return false
+}
+
+/**
+ * Turns on [status] (e.g. "Completed") in the source's Status filter. Returns false when the source has none.
+ */
+fun FilterList.applyStatus(status: String): Boolean {
+    for (sourceFilter in this) {
+        if (!sourceFilter.name.contains("status", ignoreCase = true)) continue
+        if (sourceFilter is Filter.Group<*>) {
+            for (filter in sourceFilter.state) {
+                if (filter is Filter<*> && filter.name.equals(status, true)) {
+                    when (filter) {
+                        is Filter.TriState -> filter.state = 1
+                        is Filter.CheckBox -> filter.state = true
+                        else -> continue
+                    }
+                    return true
+                }
+            }
+        } else if (sourceFilter is Filter.Select<*>) {
+            val index = sourceFilter.values.map { it.toString() }
+                .indexOfFirst { it.equals(status, true) }
             if (index != -1) {
                 sourceFilter.state = index
                 return true

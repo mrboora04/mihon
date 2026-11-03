@@ -16,6 +16,15 @@ Discover and read manga, webtoons, comics, and more – easier than ever on your
 [![License: Apache-2.0](https://img.shields.io/github/license/mihonapp/mihon?labelColor=27303D&color=0877d2)](/LICENSE)
 [![Translation status](https://img.shields.io/weblate/progress/mihon?labelColor=27303D&color=946300)](https://hosted.weblate.org/engage/mihon/)
 
+<div align="left">
+
+> [!NOTE]
+> **Personal fork, not an official Mihon release.** It adds **Browse → For you**: recommendations from [MangaUpdates](https://www.mangaupdates.com) based on what you read, finish and search, plus **Trending** (week / month / 3 months) and **Top rated** lists. Each pick shows hashtags saying why.
+>
+> Manga sites are only searched when you tap a title. MangaUpdates is asked at most 30 times an hour, with answers cached. Settings live in **Settings → Personalised**. Test builds are under [Releases](../../releases).
+
+</div>
+
 ## Download
 
 [![Mihon Stable](https://img.shields.io/github/release/mihonapp/mihon.svg?maxAge=3600&label=Stable&labelColor=06599d&color=043b69)](https://mihon.app/download)

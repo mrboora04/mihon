@@ -19,17 +19,9 @@ class SuggestionPreferences(
     val enabled: Preference<Boolean> = preferenceStore.getBoolean("suggestions_enabled", true)
 
     val signals: Preference<Set<SuggestionSignal>> = preferenceStore.getEnumSet(
-        "suggestions_signals",
+        "for_you_signals",
         SuggestionSignal.entries.toSet(),
     )
-
-    /** When false, every enabled source is checked (pinned first). */
-    val pinnedSourcesOnly: Preference<Boolean> = preferenceStore.getBoolean("suggestions_pinned_only", false)
-
-    val hideInLibrary: Preference<Boolean> = preferenceStore.getBoolean("suggestions_hide_in_library", true)
-
-    /** Chapters at or below this count are tagged #short. 0 turns length tags off. */
-    val shortThreshold: Preference<Int> = preferenceStore.getInt("suggestions_short_chapters", 0)
 
     val recordSearches: Preference<Boolean> = preferenceStore.getBoolean("suggestions_record_searches", true)
 
@@ -52,6 +44,29 @@ class SuggestionPreferences(
         recentSearches.delete()
     }
 
+    /** Times (epoch ms) of recent MangaUpdates requests, for [ForYouLimiter]'s hourly and daily caps. */
+    private val requestLog: Preference<String> = preferenceStore.getString(
+        Preference.appStateKey("for_you_request_log"),
+        "",
+    )
+
+    fun getRequestLog(): List<Long> = requestLog.get().split(',').mapNotNull { it.toLongOrNull() }
+
+    fun setRequestLog(times: List<Long>) {
+        requestLog.set(times.joinToString(","))
+    }
+
+    /** No MangaUpdates requests until this time (epoch ms), set after a failed request. */
+    val pausedUntil: Preference<Long> = preferenceStore.getLong(
+        Preference.appStateKey("for_you_paused_until"),
+        0L,
+    )
+
+    val lastManualRefresh: Preference<Long> = preferenceStore.getLong(
+        Preference.appStateKey("for_you_last_refresh"),
+        0L,
+    )
+
     companion object {
         const val MAX_RECENT_SEARCHES = 20
     }
@@ -59,9 +74,6 @@ class SuggestionPreferences(
 
 enum class SuggestionSignal {
     SEARCHED,
-    GENRES,
     FINISHED,
-    AUTHORS,
-    POPULAR,
-    LATEST,
+    READING,
 }

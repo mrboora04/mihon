@@ -5,8 +5,12 @@ import eu.kanade.tachiyomi.R
 import eu.kanade.tachiyomi.data.database.models.Track
 import eu.kanade.tachiyomi.data.track.BaseTracker
 import eu.kanade.tachiyomi.data.track.DeletableTracker
+import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUAuthorSeries
 import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUListItem
 import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MURating
+import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MURecord
+import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUSearchResultItem
+import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUSeriesSearchRequest
 import eu.kanade.tachiyomi.data.track.model.TrackSearch
 import tachiyomi.i18n.MR
 import tachiyomi.domain.track.model.Track as DomainTrack
@@ -37,6 +41,22 @@ class MangaUpdates(id: Long) : BaseTracker(id, "MangaUpdates"), DeletableTracker
     private val interceptor by lazy { MangaUpdatesInterceptor(this) }
 
     private val api by lazy { MangaUpdatesApi(client, interceptor) }
+
+    /** Public series data, including recommendations. Doesn't need a logged-in account. */
+    suspend fun getSeriesDetails(seriesId: Long): MURecord? = api.getSeriesDetails(seriesId)
+
+    /** Public search, novels excluded. Doesn't need a logged-in account. */
+    suspend fun searchSeries(query: String): List<MURecord> = api.search(query)
+
+    /** Public filtered search (genre, category, completed, sort by rating or popularity). */
+    suspend fun searchSeries(request: MUSeriesSearchRequest): List<MURecord> = api.searchSeries(request)
+
+    /** Public filtered search that also says which title or alternative name matched. */
+    suspend fun searchSeriesHits(request: MUSeriesSearchRequest): List<MUSearchResultItem> =
+        api.searchSeriesHits(request)
+
+    /** Public list of an author's series. */
+    suspend fun getAuthorSeries(authorId: Long): List<MUAuthorSeries> = api.getAuthorSeries(authorId)
 
     override fun getLogo(): Int = R.drawable.brand_mangaupdates
 

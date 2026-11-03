@@ -22,6 +22,15 @@ data class MURecord(
     @SerialName("latest_chapter")
     val latestChapter: Int? = null,
     val authors: List<MUAuthor> = emptyList(),
+    // MangaUpdates sends null rather than [] for some of these lists
+    val genres: List<MUGenre>? = null,
+    val status: String? = null,
+    val completed: Boolean? = null,
+    val categories: List<MUCategory>? = null,
+    val rank: MURank? = null,
+    val recommendations: List<MURecommendation>? = null,
+    @SerialName("category_recommendations")
+    val categoryRecommendations: List<MURecommendation>? = null,
 ) {
     fun toTrackSearch(id: Long): TrackSearch {
         return TrackSearch.create(id).apply {

@@ -4,10 +4,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.ReadOnlyComposable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.platform.LocalContext
 import eu.kanade.domain.suggestions.SuggestionSignal
 import eu.kanade.presentation.more.settings.Preference
 import eu.kanade.tachiyomi.util.system.toast
+import kotlinx.coroutines.launch
 import mihon.app.di.appGraph
 import tachiyomi.i18n.MR
 import tachiyomi.presentation.core.i18n.pluralStringResource
@@ -23,7 +25,9 @@ object SettingsPersonalisedScreen : SearchableSettings {
     @Composable
     override fun getPreferences(): List<Preference> {
         val context = LocalContext.current
+        val scope = rememberCoroutineScope()
         val preferences = remember { context.appGraph.suggestionPreferences }
+        val cache = remember { context.appGraph.suggestionCache }
 
         val enabled by preferences.enabled.collectAsState()
         val recentSearches by preferences.recentSearches.collectAsState()
@@ -41,12 +45,9 @@ object SettingsPersonalisedScreen : SearchableSettings {
                     Preference.PreferenceItem.MultiSelectListPreference(
                         preference = preferences.signals,
                         entries = mapOf(
-                            SuggestionSignal.SEARCHED to stringResource(MR.strings.suggestion_signal_searched),
                             SuggestionSignal.FINISHED to stringResource(MR.strings.suggestion_signal_finished),
-                            SuggestionSignal.GENRES to stringResource(MR.strings.suggestion_signal_genres),
-                            SuggestionSignal.AUTHORS to stringResource(MR.strings.suggestion_signal_authors),
-                            SuggestionSignal.POPULAR to stringResource(MR.strings.suggestion_signal_popular),
-                            SuggestionSignal.LATEST to stringResource(MR.strings.suggestion_signal_latest),
+                            SuggestionSignal.READING to stringResource(MR.strings.suggestion_signal_reading),
+                            SuggestionSignal.SEARCHED to stringResource(MR.strings.suggestion_signal_searched),
                         ),
                         title = stringResource(MR.strings.pref_suggestions_signals),
                         // Keep the summary in the same order as the dialog, not the stored set's order
@@ -56,42 +57,19 @@ object SettingsPersonalisedScreen : SearchableSettings {
                         },
                         visible = enabled,
                     ),
-                    Preference.PreferenceItem.InfoPreference(
-                        title = stringResource(MR.strings.pref_suggestions_info),
-                    ),
-                ),
-            ),
-            Preference.PreferenceGroup(
-                title = stringResource(MR.strings.label_sources),
-                visible = enabled,
-                preferenceItems = listOf(
-                    Preference.PreferenceItem.SwitchPreference(
-                        preference = preferences.pinnedSourcesOnly,
-                        title = stringResource(MR.strings.pref_suggestions_pinned_only),
-                        subtitle = stringResource(MR.strings.pref_suggestions_pinned_only_summary),
-                    ),
-                    Preference.PreferenceItem.SwitchPreference(
-                        preference = preferences.hideInLibrary,
-                        title = stringResource(MR.strings.pref_hide_in_library_items),
-                    ),
-                ),
-            ),
-            Preference.PreferenceGroup(
-                title = stringResource(MR.strings.pref_suggestions_length),
-                visible = enabled,
-                preferenceItems = listOf(
-                    Preference.PreferenceItem.SliderPreference(
-                        preference = preferences.shortThreshold,
-                        title = stringResource(MR.strings.pref_suggestions_short_threshold),
-                        subtitle = stringResource(MR.strings.pref_suggestions_short_threshold_summary),
-                        valueText = {
-                            if (it == 0) {
-                                stringResource(MR.strings.off)
-                            } else {
-                                pluralStringResource(MR.plurals.manga_num_chapters, it, it)
+                    Preference.PreferenceItem.TextPreference(
+                        title = stringResource(MR.strings.pref_suggestions_clear_cache),
+                        subtitle = stringResource(MR.strings.pref_suggestions_clear_cache_summary),
+                        visible = enabled,
+                        onClick = {
+                            scope.launch {
+                                cache.clear()
+                                context.toast(MR.strings.pref_suggestions_cache_cleared)
                             }
                         },
-                        valueRange = 0..100 step 10,
+                    ),
+                    Preference.PreferenceItem.InfoPreference(
+                        title = stringResource(MR.strings.pref_suggestions_info),
                     ),
                 ),
             ),
@@ -106,7 +84,11 @@ object SettingsPersonalisedScreen : SearchableSettings {
                     ),
                     Preference.PreferenceItem.TextPreference(
                         title = stringResource(MR.strings.pref_suggestions_clear_searches),
-                        subtitle = pluralStringResource(MR.plurals.suggestions_saved_searches, searchCount, searchCount),
+                        subtitle = pluralStringResource(
+                            MR.plurals.suggestions_saved_searches,
+                            searchCount,
+                            searchCount,
+                        ),
                         onClick = {
                             preferences.clearRecentSearches()
                             context.toast(MR.strings.pref_suggestions_searches_cleared)

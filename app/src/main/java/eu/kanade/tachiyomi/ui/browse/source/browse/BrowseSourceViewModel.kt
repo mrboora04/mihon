@@ -23,9 +23,9 @@ import dev.zacsweers.metrox.viewmodel.ManualViewModelAssistedFactoryKey
 import eu.kanade.core.preference.asState
 import eu.kanade.domain.manga.interactor.UpdateManga
 import eu.kanade.domain.source.interactor.GetIncognitoState
+import eu.kanade.domain.source.model.applyGenre
 import eu.kanade.domain.source.service.SourcePreferences
 import eu.kanade.domain.suggestions.SuggestionPreferences
-import eu.kanade.domain.suggestions.applyGenre
 import eu.kanade.domain.track.interactor.AddTracks
 import eu.kanade.tachiyomi.data.cache.CoverCache
 import eu.kanade.tachiyomi.source.Source

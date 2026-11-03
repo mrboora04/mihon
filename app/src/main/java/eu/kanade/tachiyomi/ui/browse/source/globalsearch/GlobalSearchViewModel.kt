@@ -46,6 +46,8 @@ class GlobalSearchViewModel(
     }
 
     init {
+        // "Pinned only" with nothing pinned would always come back empty
+        if (pinnedSources.isEmpty()) updateState { it.copy(sourceFilter = SourceFilter.All) }
         extensionFilter = initialExtensionFilter
         if (initialQuery.isNotBlank() || !initialExtensionFilter.isNullOrBlank()) {
             if (extensionFilter != null) {

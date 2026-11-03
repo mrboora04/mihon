@@ -3,6 +3,8 @@ package eu.kanade.tachiyomi.data.track.mangaupdates
 import eu.kanade.tachiyomi.data.database.models.Track
 import eu.kanade.tachiyomi.data.track.mangaupdates.MangaUpdates.Companion.READING_LIST
 import eu.kanade.tachiyomi.data.track.mangaupdates.MangaUpdates.Companion.WISH_LIST
+import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUAuthorSeries
+import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUAuthorSeriesList
 import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUContext
 import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUCurrentUser
 import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUListItem
@@ -10,8 +12,11 @@ import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MULoginResponse
 import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MURating
 import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MURecord
 import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUSearchResult
+import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUSearchResultItem
+import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUSeriesSearchRequest
 import eu.kanade.tachiyomi.network.DELETE
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.HttpException
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.PUT
 import eu.kanade.tachiyomi.network.await
@@ -190,11 +195,53 @@ class MangaUpdatesApi(
                 val response = client.newCall(GET(url))
                     .await()
 
-                if (response.code == 404) {
-                    null
-                } else {
-                    response.parseAs<MURecord>()
+                when {
+                    response.code == 404 -> null
+                    // Don't parse an error body (e.g. 429) as an empty series
+                    !response.isSuccessful -> {
+                        response.close()
+                        throw HttpException(response.code)
+                    }
+                    else -> response.parseAs<MURecord>()
                 }
+            }
+        }
+    }
+
+    suspend fun searchSeries(request: MUSeriesSearchRequest): List<MURecord> {
+        return searchSeriesHits(request).map { it.record }
+    }
+
+    /** Like [searchSeries], but also says which title or alternative name matched. */
+    suspend fun searchSeriesHits(request: MUSeriesSearchRequest): List<MUSearchResultItem> {
+        return withContext(Dispatchers.IO) {
+            with(json) {
+                client.newCall(
+                    POST(
+                        url = "$BASE_URL/v1/series/search",
+                        body = encodeToString(MUSeriesSearchRequest.serializer(), request).toRequestBody(CONTENT_TYPE),
+                    ),
+                )
+                    .awaitSuccess()
+                    .parseAs<MUSearchResult>()
+                    .results
+            }
+        }
+    }
+
+    suspend fun getAuthorSeries(authorId: Long): List<MUAuthorSeries> {
+        return withContext(Dispatchers.IO) {
+            with(json) {
+                client.newCall(
+                    POST(
+                        url = "$BASE_URL/v1/authors/$authorId/series",
+                        body = """{"orderby":"year"}""".toRequestBody(CONTENT_TYPE),
+                    ),
+                )
+                    .awaitSuccess()
+                    .parseAs<MUAuthorSeriesList>()
+                    .seriesList
+                    .orEmpty()
             }
         }
     }

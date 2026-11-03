@@ -9,6 +9,7 @@ import dev.zacsweers.metrox.viewmodel.ViewModelGraph
 import eu.kanade.domain.base.BasePreferences
 import eu.kanade.domain.extension.interactor.TrustExtension
 import eu.kanade.domain.source.service.SourcePreferences
+import eu.kanade.domain.suggestions.SuggestionCache
 import eu.kanade.domain.suggestions.SuggestionPreferences
 import eu.kanade.domain.track.interactor.AddTracks
 import eu.kanade.domain.track.service.DelayedTrackingUpdateWorker
@@ -89,6 +90,7 @@ interface AppGraph : ViewModelGraph {
     val libraryPreferences: LibraryPreferences
     val sourcePreferences: SourcePreferences
     val suggestionPreferences: SuggestionPreferences
+    val suggestionCache: SuggestionCache
     val trackPreferences: TrackPreferences
     val backupPreferences: BackupPreferences
     val storagePreferences: StoragePreferences

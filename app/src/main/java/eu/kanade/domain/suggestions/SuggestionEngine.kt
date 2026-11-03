@@ -1,482 +1,539 @@
 package eu.kanade.domain.suggestions
 
 import dev.zacsweers.metro.Inject
-import eu.kanade.domain.source.service.SourcePreferences
-import eu.kanade.tachiyomi.source.Source
-import eu.kanade.tachiyomi.source.model.Filter
-import eu.kanade.tachiyomi.source.model.FilterList
-import eu.kanade.tachiyomi.source.model.MangasPage
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
+import eu.kanade.tachiyomi.data.track.TrackerManager
+import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MURecommendation
+import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MURecord
+import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUSeriesSearchRequest
+import eu.kanade.tachiyomi.util.lang.htmlDecode
+import kotlinx.serialization.json.contentOrNull
 import logcat.LogPriority
-import mihon.domain.manga.model.toDomainManga
 import tachiyomi.core.common.util.system.logcat
 import tachiyomi.domain.library.model.LibraryManga
 import tachiyomi.domain.manga.interactor.GetLibraryManga
-import tachiyomi.domain.manga.interactor.NetworkToLocalManga
-import tachiyomi.domain.manga.model.Manga
-import tachiyomi.domain.source.service.SourceManager
-import tachiyomi.source.local.isLocal
-import kotlin.time.Duration.Companion.seconds
-import eu.kanade.tachiyomi.source.model.SManga as SourceManga
+import tachiyomi.domain.track.repository.TrackRepository
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.days
 
 /**
- * Builds suggestions from the library, recent searches and the installed sources.
+ * Builds the three For you lists from MangaUpdates. Manga sites are never contacted.
  *
- * Nothing is sent anywhere except the ordinary source requests the Browse tab already makes
- * (popular, latest and search with the source's own filters). All scoring happens on the device.
+ * Every request goes through [ForYouLimiter] (spaced out, capped per hour and day), answers are
+ * cached ([SERIES_TTL], [TRENDING_TTL], [TOP_RATED_TTL]), and a round stops at the first failure.
  */
 @Inject
 class SuggestionEngine(
     private val preferences: SuggestionPreferences,
-    private val sourcePreferences: SourcePreferences,
-    private val sourceManager: SourceManager,
+    private val cache: SuggestionCache,
+    private val limiter: ForYouLimiter,
     private val getLibraryManga: GetLibraryManga,
-    private val networkToLocalManga: NetworkToLocalManga,
+    private val trackRepository: TrackRepository,
+    trackerManager: TrackerManager,
 ) {
 
-    private val dispatcher = Dispatchers.IO.limitedParallelism(5)
+    private val mangaUpdates = trackerManager.mangaUpdates
+
+    enum class TrendingPeriod(val orderBy: String) {
+        WEEK("week_pos"),
+        MONTH("month1_pos"),
+        THREE_MONTHS("month3_pos"),
+    }
+
+    /** Why a round stopped early; the screen explains it instead of retrying by itself. */
+    sealed interface Stop {
+        data class LimitReached(val retryIn: Duration) : Stop
+
+        /** MangaUpdates failed; nothing is sent again until [retryIn] has passed. */
+        data class Failed(val retryIn: Duration) : Stop
+    }
+
+    // region For you
 
     /**
-     * Runs every source request and reports a ranked snapshot as results come in, so the list can
-     * be shown before the slowest source answers. The returned value is the final snapshot.
+     * Reports what is cached straight away, then spends up to [budget] requests on titles with
+     * nothing (or an old answer) cached, reporting after each one.
      */
-    suspend fun generate(onUpdate: (Result) -> Unit = {}): Result = coroutineScope {
-        val signals = preferences.signals.get()
-        val library = getLibraryManga.await()
-        val seeds = buildSeeds(signals, library)
-        val sources = getSources()
+    suspend fun loadForYou(budget: Int, onUpdate: (ForYouResult) -> Unit = {}): ForYouResult {
+        val context = libraryContext()
+        suspend fun snapshot(stop: Stop? = null) = rankForYou(context).copy(stop = stop).also(onUpdate)
 
-        if (sources.isEmpty()) return@coroutineScope Result(emptyList(), seeds, sourceCount = 0)
-
-        // Status only comes from the source's own Status filter; list pages rarely carry it.
-        val statusSeeds = seeds.filterIsInstance<Seed.Genre>().firstOrNull()?.let { top ->
-            listOf(
-                top.copy(tags = top.tags + SuggestionTag.Completed, weight = 1, status = STATUS_COMPLETED),
-                top.copy(tags = top.tags + SuggestionTag.Ongoing, weight = 1, status = STATUS_ONGOING),
-            )
-        }.orEmpty()
-
-        // Requests start roughly in this order, so the personal ones go first across every source,
-        // and popular/latest (not personal) last and only from the top sources.
-        val requests = buildList {
-            seeds.forEach { seed -> sources.forEach { add(Request(it, seed)) } }
-            statusSeeds.forEach { seed -> sources.forEach { add(Request(it, seed)) } }
-            sources.take(GENERIC_LISTING_SOURCES).forEach { source ->
-                if (SuggestionSignal.POPULAR in signals) add(Request(source, Seed.Popular))
-                if (SuggestionSignal.LATEST in signals && source.supportsLatest) add(Request(source, Seed.Latest))
-            }
-        }
-
-        val ranking = Ranking(
-            library = library,
-            hideInLibrary = preferences.hideInLibrary.get(),
-            topGenres = seeds.filterIsInstance<Seed.Genre>().mapTo(HashSet()) { it.genre.lowercase() },
-            pinned = sourcePreferences.pinnedSources.get(),
-        )
-        val mutex = Mutex()
-        var finished = 0
-        var lastUpdate = 0L
-
-        suspend fun snapshot() = Result(
-            suggestions = ranking.suggestions(),
-            seeds = seeds,
-            sourceCount = sources.size,
-            checked = finished,
-            total = requests.size,
-        )
-
-        onUpdate(Result(emptyList(), seeds, sources.size, checked = 0, total = requests.size))
-        requests.map { request ->
-            async {
-                val page = fetch(request)
-                mutex.withLock {
-                    ranking.add(request, page)
-                    finished++
-                    val now = System.currentTimeMillis()
-                    if (now - lastUpdate >= UPDATE_INTERVAL_MS) {
-                        lastUpdate = now
-                        onUpdate(snapshot())
+        var result = snapshot()
+        val runner = Runner(budget)
+        for (step in pendingForYouWork(context)) {
+            if (runner.remaining <= 0) break
+            val ok = when (step) {
+                is Work.Search -> runner.run { search(step.query) }
+                is Work.Fetch -> runner.run { fetchSeries(step.seriesId) }
+                is Work.Author -> runner.run { fetchAuthor(step.authorId) }
+                is Work.Match -> runner.run { match(step.seed) } && run {
+                    // Fetch its recommendations right away if the match was found
+                    val seriesId = cache.read { it.matches[step.seed.mangaId] }
+                    if (seriesId == null || seriesId == SuggestionCache.NO_MATCH || runner.remaining <= 0) {
+                        true
+                    } else {
+                        result = snapshot()
+                        runner.run { fetchSeries(seriesId) }
                     }
                 }
             }
-        }.awaitAll()
-
-        val threshold = preferences.shortThreshold.get()
-        if (threshold > 0) {
-            ranking.ranked().take(LENGTH_CHECK_LIMIT).map { candidate ->
-                async { candidate to chapterCount(candidate) }
-            }.awaitAll().forEach { (candidate, count) ->
-                candidate.lengthTag = when {
-                    count == null || count == 0 -> null
-                    count <= threshold -> SuggestionTag.ShortSeries
-                    count >= threshold * 4 -> SuggestionTag.LongSeries
-                    else -> null
-                }
-            }
+            if (!ok) return snapshot(runner.stop)
+            result = snapshot()
         }
-
-        snapshot().also(onUpdate)
+        return result
     }
 
-    /**
-     * Collects results as they arrive. Tags that depend on everything seen so far (genre overlap,
-     * found in more than one source) are worked out fresh on every snapshot rather than stored.
-     */
-    private inner class Ranking(
-        library: List<LibraryManga>,
-        private val hideInLibrary: Boolean,
-        private val topGenres: Set<String>,
-        private val pinned: Set<String>,
-    ) {
-        private val libraryKeys = library.mapTo(HashSet()) { it.manga.source to it.manga.url }
-        private val libraryTitles = library.mapTo(HashSet()) { it.manga.title.normalized() }
-        private val candidates = LinkedHashMap<Pair<Long, String>, Candidate>()
-        private val sourcesByTitle = HashMap<String, MutableSet<Long>>()
-        private val localManga = HashMap<Pair<Long, String>, Manga>()
-
-        fun add(request: Request, page: MangasPage?) {
-            page?.mangas?.forEach { sManga ->
-                val key = request.source.id to sManga.url
-                if (hideInLibrary && (key in libraryKeys || sManga.title.normalized() in libraryTitles)) {
-                    return@forEach
+    private suspend fun pendingForYouWork(context: LibraryContext): List<Work> = cache.read { data ->
+        val now = System.currentTimeMillis()
+        buildList {
+            context.searches.forEach { query ->
+                if (data.searches[query.lowercase()].isStale(now, SERIES_TTL)) add(Work.Search(query))
+            }
+            context.seeds.forEach { seed ->
+                when (val seriesId = context.seriesIdOf(seed, data)) {
+                    null -> add(Work.Match(seed))
+                    SuggestionCache.NO_MATCH -> {}
+                    else -> if (data.series[seriesId].isStale(now, SERIES_TTL)) add(Work.Fetch(seriesId))
                 }
-                val candidate = candidates.getOrPut(key) { Candidate(request.source, sManga) }
-                candidate.seedTags += request.seed.tags
-                candidate.seedScore += request.seed.weight
-                sourcesByTitle.getOrPut(sManga.title.normalized()) { HashSet() } += request.source.id
+            }
+            // Authors come last: they need the series fetched first, and are a smaller signal
+            context.seeds
+                .mapNotNull { seed -> context.seriesIdOf(seed, data)?.let { data.series[it] } }
+                .flatMap { it.authorIds.take(1) }
+                .distinct()
+                .take(MAX_AUTHORS)
+                .filter { data.authors[it].isStale(now, SERIES_TTL) }
+                .forEach { add(Work.Author(it)) }
+        }
+    }
+
+    private suspend fun rankForYou(context: LibraryContext): ForYouResult = cache.read { data ->
+        val picks = Picks(context, data)
+
+        context.searches.forEach { query ->
+            data.searches[query.lowercase()]?.results?.take(SEARCH_RESULTS_USED)?.forEach { entry ->
+                picks.add(entry, SuggestionTag.Searched, score = 3)
             }
         }
-
-        fun ranked(): List<Candidate> {
-            return candidates.values
-                .onEach(::scoreCandidate)
-                .sortedWith(compareByDescending<Candidate> { it.score }.thenByDescending { it.tags.size })
-                .distinctBy { it.sManga.title.normalized() }
-                .take(MAX_RESULTS)
-        }
-
-        suspend fun suggestions(): List<Suggestion> {
-            val ranked = ranked()
-            val missing = ranked.filter { it.key !in localManga }
-            if (missing.isNotEmpty()) {
-                networkToLocalManga(missing.map { it.sManga.toDomainManga(it.source.id) })
-                    .forEachIndexed { index, manga -> localManga[missing[index].key] = manga }
-            }
-            return ranked.map { candidate ->
-                Suggestion(
-                    manga = localManga.getValue(candidate.key),
-                    sourceName = candidate.source.name,
-                    tags = candidate.tags.sortedBy { it.order },
-                    score = candidate.score,
+        var checkedTitles = 0
+        context.seeds.forEach { seed ->
+            val series = context.seriesIdOf(seed, data)?.let { data.series[it] } ?: return@forEach
+            checkedTitles++
+            val seedWeight = if (seed.finished) 2 else 1
+            val reason = if (seed.finished) SuggestionTag.Finished else SuggestionTag.Reading
+            series.readersPicks.forEach { entry ->
+                picks.add(
+                    entry,
+                    reason,
+                    SuggestionTag.ReadersPick,
+                    score = entry.weight * 2 * seedWeight,
+                    because = seed.title,
                 )
             }
+            series.similar.forEach { entry ->
+                picks.add(entry, reason, SuggestionTag.SimilarTags, score = seedWeight, because = seed.title)
+            }
+            series.authorIds.take(1).forEach { authorId ->
+                data.authors[authorId]?.results?.forEach { entry ->
+                    picks.add(entry, reason, SuggestionTag.SameAuthor, score = seedWeight, because = seed.title)
+                }
+            }
         }
 
-        private fun scoreCandidate(candidate: Candidate) {
-            val tags = LinkedHashSet(candidate.seedTags)
-            var score = candidate.seedScore
-            val domain = candidate.sManga.toDomainManga(candidate.source.id)
-            domain.genre.orEmpty()
-                .filter { it.lowercase() in topGenres }
-                .forEach {
-                    if (tags.add(SuggestionTag.Genre(it))) score += 1
-                }
-            if ((sourcesByTitle[candidate.sManga.title.normalized()]?.size ?: 0) > 1) {
-                tags += SuggestionTag.MultiSource
-                score += 1
-            }
-            when (domain.status.toInt()) {
-                SourceManga.COMPLETED, SourceManga.PUBLISHING_FINISHED -> tags += SuggestionTag.Completed
-                SourceManga.ONGOING -> tags += SuggestionTag.Ongoing
-            }
-            candidate.lengthTag?.let { tags += it }
-            // Every suggestion carries at least two reasons; the source it came from is always a true one.
-            if (tags.size < 2) {
-                tags += if ("${candidate.source.id}" in pinned) {
-                    SuggestionTag.PinnedSource
-                } else {
-                    SuggestionTag.FromSource(candidate.source.name)
-                }
-            }
-            candidate.tags = tags
-            candidate.score = score
+        val pendingTitles = context.seeds.count { seed ->
+            val seriesId = context.seriesIdOf(seed, data)
+            seriesId == null || (seriesId != SuggestionCache.NO_MATCH && seriesId !in data.series)
         }
+        ForYouResult(
+            suggestions = picks.ranked(),
+            hasSeeds = context.seeds.isNotEmpty() || context.searches.isNotEmpty(),
+            checkedTitles = checkedTitles,
+            pendingTitles = pendingTitles,
+            yourCategories = context.topCategories(data),
+        )
+    }
+
+    // endregion
+
+    // region Trending and Top rated
+
+    /** One MangaUpdates request per period per day, at most. */
+    suspend fun loadTrending(period: TrendingPeriod): ListResult = loadList(
+        key = "trending:${period.name}",
+        ttl = TRENDING_TTL,
+        tags = listOf(SuggestionTag.Trending),
+        ranked = true,
+        request = { MUSeriesSearchRequest(orderby = period.orderBy) },
+    )
+
+    /**
+     * Best-rated series with English chapters, either in the genres the user reads most or in one of
+     * their reader categories. One request per choice per week, at most.
+     */
+    suspend fun loadTopRated(category: String?): ListResult {
+        val context = libraryContext()
+        val genres = cache.read { context.topGenres(it) }.take(2)
+        if (category == null && genres.isEmpty()) return ListResult(emptyList(), needsLibrary = true)
+        return loadList(
+            key = if (category != null) "top:category:$category" else "top:genres:${genres.joinToString("+")}",
+            ttl = TOP_RATED_TTL,
+            tags = listOfNotNull(SuggestionTag.TopRated, category?.let(SuggestionTag::category)),
+            ranked = false,
+            context = context,
+            request = {
+                MUSeriesSearchRequest(
+                    genre = genres.takeIf { category == null },
+                    category = category?.let(::listOf),
+                    filters = listOf("scanlated"),
+                    orderby = "rating",
+                )
+            },
+        )
+    }
+
+    private suspend fun loadList(
+        key: String,
+        ttl: Duration,
+        tags: List<SuggestionTag>,
+        ranked: Boolean,
+        context: LibraryContext? = null,
+        request: () -> MUSeriesSearchRequest,
+    ): ListResult {
+        val libraryContext = context ?: libraryContext()
+        var stop: Stop? = null
+        val stale = cache.read { it.lists[key] }.isStale(System.currentTimeMillis(), ttl)
+        if (stale) {
+            val runner = Runner(budget = 1)
+            val ok = runner.run {
+                val results = mangaUpdates.searchSeries(request()).mapNotNull(::toEntry)
+                cache.edit { it.lists[key] = SuggestionCache.Search(System.currentTimeMillis(), results) }
+            }
+            if (!ok) stop = runner.stop
+        }
+        return cache.read { data ->
+            val picks = Picks(libraryContext, data)
+            data.lists[key]?.results?.forEachIndexed { index, entry ->
+                picks.add(entry, *tags.toTypedArray(), score = 1000 - index, rank = (index + 1).takeIf { ranked })
+            }
+            ListResult(picks.ranked(), stop = stop)
+        }
+    }
+
+    // endregion
+
+    suspend fun clearCache() = cache.clear()
+
+    fun refreshCooldown() = limiter.refreshCooldown()
+
+    fun markManualRefresh() = limiter.markManualRefresh()
+
+    /** Runs requests through the limiter until the budget runs out or one fails. */
+    private inner class Runner(budget: Int) {
+        var remaining = budget
+            private set
+        var stop: Stop? = null
+            private set
+
+        suspend fun run(block: suspend () -> Unit): Boolean {
+            if (remaining <= 0) return false
+            remaining--
+            return try {
+                limiter.request { block() }
+                true
+            } catch (e: ForYouLimiter.LimitReachedException) {
+                stop = if (e.afterFailure) Stop.Failed(e.retryIn) else Stop.LimitReached(e.retryIn)
+                false
+            } catch (e: Exception) {
+                // Covers 429/5xx and timeouts alike: back off for a while rather than keep asking
+                logcat(LogPriority.WARN, e) { "For you: MangaUpdates request failed, pausing requests" }
+                limiter.pauseAfterFailure()
+                stop = Stop.Failed(ForYouLimiter.FAILURE_PAUSE)
+                false
+            }
+        }
+    }
+
+    private suspend fun match(seed: Seed) {
+        val normalizedTitle = seed.title.normalized()
+        // Sources often use an English title while MangaUpdates' main title is romaji, so an
+        // alternative name matching exactly counts too
+        val found = mangaUpdates.searchSeriesHits(MUSeriesSearchRequest(search = seed.title))
+            .firstOrNull { item ->
+                listOfNotNull(item.record.title, item.hitTitle)
+                    .any { it.htmlDecode().normalized() == normalizedTitle }
+            }
+            ?.record
+            ?.seriesId
+        cache.edit { it.matches[seed.mangaId] = found ?: SuggestionCache.NO_MATCH }
+    }
+
+    private suspend fun fetchSeries(seriesId: Long) {
+        val record = mangaUpdates.getSeriesDetails(seriesId)
+        cache.edit {
+            it.series[seriesId] = SuggestionCache.Series(
+                fetchedAt = System.currentTimeMillis(),
+                readersPicks = record?.recommendations.orEmpty().mapNotNull(::toEntry),
+                similar = record?.categoryRecommendations.orEmpty().mapNotNull(::toEntry),
+                genres = record?.genres.orEmpty().mapNotNull { genre -> genre.genre },
+                categories = record?.categories.orEmpty()
+                    .filter { (it.votes ?: 0) >= MIN_CATEGORY_VOTES }
+                    .sortedByDescending { it.votes }
+                    .mapNotNull { it.category?.htmlDecode() }
+                    .take(MAX_CATEGORIES_PER_SERIES),
+                authorIds = record?.authors.orEmpty().filter { it.type == "Author" }.mapNotNull { it.authorId },
+            )
+        }
+    }
+
+    private suspend fun fetchAuthor(authorId: Long) {
+        val series = mangaUpdates.getAuthorSeries(authorId).mapNotNull { item ->
+            SuggestionCache.Entry(
+                id = item.seriesId ?: return@mapNotNull null,
+                title = item.title?.htmlDecode() ?: return@mapNotNull null,
+                url = item.url,
+                year = item.year?.contentOrNull,
+                genres = item.genres.orEmpty(),
+            )
+        }
+        cache.edit { it.authors[authorId] = SuggestionCache.Search(System.currentTimeMillis(), series) }
+    }
+
+    private suspend fun search(query: String) {
+        val results = mangaUpdates.searchSeries(query).mapNotNull(::toEntry)
+        cache.edit { it.searches[query.lowercase()] = SuggestionCache.Search(System.currentTimeMillis(), results) }
+    }
+
+    private fun toEntry(record: MURecord): SuggestionCache.Entry? = SuggestionCache.Entry(
+        // The search excludes novels, but drop any that slip through: For you is for comics
+        id = record.seriesId?.takeUnless { record.type.equals("Novel", ignoreCase = true) } ?: return null,
+        title = record.title?.htmlDecode() ?: return null,
+        url = record.url,
+        cover = record.image?.url?.original,
+        rating = record.bayesianRating?.takeIf { it > 0 },
+        type = record.type,
+        year = record.year,
+        genres = record.genres.orEmpty().mapNotNull { it.genre },
+    )
+
+    private fun toEntry(rec: MURecommendation): SuggestionCache.Entry? {
+        val title = rec.seriesName?.htmlDecode() ?: return null
+        // Recommendation lists can include novels; MangaUpdates marks them in the name
+        if (NOVEL_MARKER.containsMatchIn(title)) return null
+        return SuggestionCache.Entry(
+            id = rec.seriesId ?: return null,
+            title = title,
+            url = rec.seriesUrl,
+            cover = rec.seriesImage?.url?.original,
+            weight = rec.weight?.coerceIn(1, 5) ?: 1,
+        )
+    }
+
+    private suspend fun libraryContext(): LibraryContext {
+        val signals = preferences.signals.get()
+        val library = getLibraryManga.await()
+        val trackedIds = trackRepository.getTracks()
+            .filter { it.trackerId == mangaUpdates.id && it.remoteId > 0 }
+            .associate { it.mangaId to it.remoteId }
+        val searches = if (SuggestionSignal.SEARCHED in signals) {
+            preferences.getRecentSearches().take(MAX_SEARCH_SEEDS)
+        } else {
+            emptyList()
+        }
+        return LibraryContext(library, trackedIds, buildSeeds(signals, library), searches)
     }
 
     private fun buildSeeds(signals: Set<SuggestionSignal>, library: List<LibraryManga>): List<Seed> {
-        val seeds = mutableListOf<Seed>()
-
-        if (SuggestionSignal.SEARCHED in signals) {
-            preferences.getRecentSearches()
-                .take(MAX_SEARCH_SEEDS)
-                .forEach { seeds += Seed.Query(it, SuggestionTag.Searched, weight = 3) }
-        }
-
-        if (SuggestionSignal.FINISHED in signals) {
-            library
-                .filter { it.totalChapters > 0 && it.readCount >= it.totalChapters }
-                .topGenres(MAX_FINISHED_SEEDS) { 1 }
-                .forEach { seeds += Seed.Genre(it, listOf(SuggestionTag.Finished, SuggestionTag.Genre(it)), weight = 3) }
-        }
-
-        if (SuggestionSignal.GENRES in signals) {
-            val already = seeds.filterIsInstance<Seed.Genre>().mapTo(HashSet()) { it.genre.lowercase() }
-            library
-                .topGenres(MAX_GENRE_SEEDS + already.size) { if (it.hasStarted) 2 else 1 }
-                .filterNot { it.lowercase() in already }
-                .take(MAX_GENRE_SEEDS)
-                .forEach { seeds += Seed.Genre(it, listOf(SuggestionTag.Genre(it)), weight = 2) }
-        }
-
-        if (SuggestionSignal.AUTHORS in signals) {
-            library
-                .filter { it.hasStarted }
-                .mapNotNull { it.manga.author?.takeIf(String::isNotBlank) }
-                .groupingBy { it.trim() }
-                .eachCount()
-                .entries
-                .sortedByDescending { it.value }
-                .take(MAX_AUTHOR_SEEDS)
-                .forEach { seeds += Seed.Query(it.key, SuggestionTag.Author, weight = 2) }
-        }
-
-        return seeds
-    }
-
-    private suspend fun getSources(): List<Source> {
-        val enabledLanguages = sourcePreferences.enabledLanguages.get()
-        val disabledSources = sourcePreferences.disabledSources.get()
-        val pinned = sourcePreferences.pinnedSources.get()
-        val lastUsed = sourcePreferences.lastUsedSource.get()
-        val pinnedOnly = preferences.pinnedSourcesOnly.get() && pinned.isNotEmpty()
-
-        return sourceManager.getAll()
-            .filter { !it.isLocal() && it.lang in enabledLanguages && "${it.id}" !in disabledSources }
-            .filter { !pinnedOnly || "${it.id}" in pinned }
+        val finishedIds = library
+            .filter { it.totalChapters > 0 && it.readCount >= it.totalChapters }
+            .mapTo(HashSet()) { it.id }
+        return library
+            .filter { item ->
+                val finished = item.id in finishedIds
+                (finished && SuggestionSignal.FINISHED in signals) ||
+                    (!finished && item.hasStarted && SuggestionSignal.READING in signals)
+            }
             .sortedWith(
-                compareBy(
-                    { "${it.id}" !in pinned },
-                    { it.id != lastUsed },
-                    { it.name.lowercase() },
-                ),
+                compareByDescending<LibraryManga> { it.id in finishedIds }
+                    .thenByDescending { it.lastRead }
+                    .thenByDescending { it.readCount },
             )
+            .take(MAX_SEEDS)
+            .map { Seed(it.manga.id, it.manga.title, finished = it.id in finishedIds) }
     }
 
-    private suspend fun fetch(request: Request): MangasPage? {
-        val source = request.source
-        return try {
-            withTimeoutOrNull(REQUEST_TIMEOUT) {
-                withContext(dispatcher) {
-                    when (val seed = request.seed) {
-                        Seed.Popular -> source.getPopularManga(1)
-                        Seed.Latest -> source.getLatestUpdates(1)
-                        is Seed.Query -> source.getSearchManga(1, seed.query, source.getFilterList())
-                        is Seed.Genre -> {
-                            // Same genre matching the Browse screen uses when you tap a genre tag
-                            val filters = source.getFilterList()
-                            // No Status filter on this source: skip rather than guess
-                            if (seed.status != null && !filters.applyStatus(seed.status)) return@withContext null
-                            if (filters.applyGenre(seed.genre)) {
-                                source.getSearchManga(1, "", filters)
-                            } else {
-                                source.getSearchManga(1, seed.genre, filters)
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            logcat(LogPriority.WARN, e) { "Suggestions: ${source.name} failed for ${request.seed}" }
-            null
-        }
-    }
-
-    private suspend fun chapterCount(candidate: Candidate): Int? {
-        return try {
-            withTimeoutOrNull(REQUEST_TIMEOUT) {
-                withContext(dispatcher) {
-                    candidate.source.getMangaUpdate(
-                        manga = candidate.sManga,
-                        chapters = emptyList(),
-                        fetchDetails = false,
-                        fetchChapters = true,
-                    ).chapters.size
-                }
-            }
-        } catch (e: Exception) {
-            logcat(LogPriority.WARN, e) { "Suggestions: chapter count failed for ${candidate.sManga.title}" }
-            null
-        }
-    }
-
-    private fun List<LibraryManga>.topGenres(count: Int, weight: (LibraryManga) -> Int): List<String> {
-        val counts = HashMap<String, Int>()
-        val display = HashMap<String, String>()
-        forEach { item ->
-            item.manga.genre.orEmpty().forEach { genre ->
-                val key = genre.trim().lowercase()
-                if (key.isEmpty()) return@forEach
-                display.putIfAbsent(key, genre.trim())
-                counts[key] = (counts[key] ?: 0) + weight(item)
-            }
-        }
-        return counts.entries
-            .sortedByDescending { it.value }
-            .take(count)
-            .map { display.getValue(it.key) }
-    }
-
-    private fun String.normalized(): String = lowercase().filter(Char::isLetterOrDigit)
-
-    data class Result(
-        val suggestions: List<Suggestion>,
+    private class LibraryContext(
+        library: List<LibraryManga>,
+        val trackedIds: Map<Long, Long>,
         val seeds: List<Seed>,
-        val sourceCount: Int,
-        val checked: Int = 0,
-        val total: Int = 0,
+        val searches: List<String>,
+    ) {
+        val libraryIds = library.map { it.manga.id }
+        val libraryTitles = library.mapTo(HashSet()) { it.manga.title.normalized() }
+
+        fun seriesIdOf(seed: Seed, data: SuggestionCache.Data) = trackedIds[seed.mangaId] ?: data.matches[seed.mangaId]
+
+        fun librarySeriesIds(data: SuggestionCache.Data) =
+            libraryIds.mapNotNullTo(HashSet()) { trackedIds[it] ?: data.matches[it] }
+
+        private fun seedSeries(data: SuggestionCache.Data) =
+            seeds.mapNotNull { seed -> seriesIdOf(seed, data)?.let { data.series[it] } }
+
+        /** MangaUpdates genres the user reads most, from the titles already looked up. */
+        fun topGenres(data: SuggestionCache.Data): List<String> =
+            seedSeries(data).flatMap { it.genres }.mostCommon()
+
+        /** Reader categories the user's titles share most, used as hashtags. */
+        fun topCategories(data: SuggestionCache.Data): List<String> =
+            seedSeries(data).flatMap { it.categories }.mostCommon().take(MAX_YOUR_CATEGORIES)
+
+        private fun List<String>.mostCommon() =
+            groupingBy { it }.eachCount().entries.sortedByDescending { it.value }.map { it.key }
+    }
+
+    /** Collects candidates, skipping anything already in the library. */
+    private class Picks(private val context: LibraryContext, data: SuggestionCache.Data) {
+        private val librarySeriesIds = context.librarySeriesIds(data)
+        private val topGenres = context.topGenres(data).take(MAX_GENRE_TAGS).toSet()
+        private val candidates = LinkedHashMap<Long, Candidate>()
+
+        fun add(
+            entry: SuggestionCache.Entry,
+            vararg tags: SuggestionTag,
+            score: Int,
+            because: String? = null,
+            rank: Int? = null,
+        ) {
+            if (entry.id in librarySeriesIds || entry.title.normalized() in context.libraryTitles) return
+            val c = candidates.getOrPut(entry.id) { Candidate(entry) }
+            c.tags += tags
+            c.score += score
+            because?.let { c.because += it }
+            if (rank != null) c.rank = rank
+        }
+
+        fun ranked(): List<Suggestion> = candidates.values
+            .onEach { c ->
+                if (c.because.size > 1) {
+                    c.tags += SuggestionTag.MultiPick
+                    c.score += c.because.size
+                }
+                c.entry.genres.filter { it in topGenres }.forEach { c.tags += SuggestionTag.genre(it) }
+                c.entry.type?.takeIf { it.isNotBlank() }?.let { c.tags += SuggestionTag.type(it) }
+                // Every suggestion shows at least two reasons; where it came from is always true
+                if (c.tags.size < 2) c.tags += SuggestionTag.MangaUpdates
+            }
+            .sortedWith(compareByDescending<Candidate> { it.score }.thenBy { it.entry.title })
+            .take(MAX_RESULTS)
+            .map { c ->
+                Suggestion(
+                    seriesId = c.entry.id,
+                    title = c.entry.title,
+                    coverUrl = c.entry.cover,
+                    url = c.entry.url,
+                    rating = c.entry.rating,
+                    year = c.entry.year,
+                    rank = c.rank,
+                    because = c.because.toList(),
+                    tags = c.tags.sortedBy { it.order },
+                )
+            }
+    }
+
+    data class ForYouResult(
+        val suggestions: List<Suggestion>,
+        val hasSeeds: Boolean,
+        val checkedTitles: Int,
+        val pendingTitles: Int,
+        val yourCategories: List<String>,
+        val stop: Stop? = null,
     )
 
-    sealed interface Seed {
-        val tags: List<SuggestionTag>
-        val weight: Int
+    data class ListResult(
+        val suggestions: List<Suggestion>,
+        /** Top rated needs a few library titles looked up first, to know the user's genres. */
+        val needsLibrary: Boolean = false,
+        val stop: Stop? = null,
+    )
 
-        data class Query(val query: String, val tag: SuggestionTag, override val weight: Int) : Seed {
-            override val tags = listOf(tag)
-        }
+    private data class Seed(val mangaId: Long, val title: String, val finished: Boolean)
 
-        data class Genre(
-            val genre: String,
-            override val tags: List<SuggestionTag>,
-            override val weight: Int,
-            val status: String? = null,
-        ) : Seed
-
-        data object Popular : Seed {
-            override val tags = listOf(SuggestionTag.Popular)
-            override val weight = 1
-        }
-
-        data object Latest : Seed {
-            override val tags = listOf(SuggestionTag.New)
-            override val weight = 1
-        }
+    private sealed interface Work {
+        data class Match(val seed: Seed) : Work
+        data class Fetch(val seriesId: Long) : Work
+        data class Author(val authorId: Long) : Work
+        data class Search(val query: String) : Work
     }
 
-    private data class Request(val source: Source, val seed: Seed)
-
-    private class Candidate(val source: Source, val sManga: SourceManga) {
-        val key = source.id to sManga.url
-        val seedTags = LinkedHashSet<SuggestionTag>()
-        var seedScore = 0
-        var lengthTag: SuggestionTag? = null
-
-        // Recomputed by Ranking on every snapshot
-        var tags: Set<SuggestionTag> = emptySet()
+    private class Candidate(val entry: SuggestionCache.Entry) {
+        val tags = LinkedHashSet<SuggestionTag>()
+        val because = LinkedHashSet<String>()
         var score = 0
+        var rank: Int? = null
     }
 
     companion object {
-        private const val MAX_RESULTS = 60
+        private const val MAX_RESULTS = 80
+        private const val MAX_SEEDS = 40
+        private const val MAX_AUTHORS = 8
         private const val MAX_SEARCH_SEEDS = 3
-        private const val MAX_FINISHED_SEEDS = 2
-        private const val MAX_GENRE_SEEDS = 3
-        private const val MAX_AUTHOR_SEEDS = 2
-        private const val LENGTH_CHECK_LIMIT = 20
-        private const val GENERIC_LISTING_SOURCES = 3
-        private val REQUEST_TIMEOUT = 15.seconds
-        private const val UPDATE_INTERVAL_MS = 400L
-        private const val STATUS_COMPLETED = "Completed"
-        private const val STATUS_ONGOING = "Ongoing"
+        private const val SEARCH_RESULTS_USED = 5
+        private const val MIN_CATEGORY_VOTES = 3
+        private const val MAX_CATEGORIES_PER_SERIES = 8
+        private const val MAX_YOUR_CATEGORIES = 6
+        private const val MAX_GENRE_TAGS = 4
+        private val SERIES_TTL = 7.days
+        private val TRENDING_TTL = 1.days
+        private val TOP_RATED_TTL = 7.days
+        private val NOVEL_MARKER = Regex("""\((Light )?Novel\)""", RegexOption.IGNORE_CASE)
     }
 }
 
+private fun String.normalized(): String = lowercase().filter(Char::isLetterOrDigit)
+
+private fun SuggestionCache.Series?.isStale(now: Long, ttl: Duration) =
+    this == null || now - fetchedAt > ttl.inWholeMilliseconds
+
+private fun SuggestionCache.Search?.isStale(now: Long, ttl: Duration) =
+    this == null || now - fetchedAt > ttl.inWholeMilliseconds
+
 data class Suggestion(
-    val manga: Manga,
-    val sourceName: String,
+    val seriesId: Long,
+    val title: String,
+    val coverUrl: String?,
+    val url: String?,
+    val rating: Double?,
+    val year: String?,
+    /** Position in a trending list, 1-based. */
+    val rank: Int?,
+    val because: List<String>,
     val tags: List<SuggestionTag>,
-    val score: Int,
 )
 
 /**
- * A reason a title was suggested. [label] is shown as a hashtag on the suggestion.
+ * A reason a title was suggested, shown as a hashtag. Genre and type tags are made on the fly.
  */
-sealed class SuggestionTag(val label: String, val order: Int) {
-    data object Searched : SuggestionTag("#searched", 0)
-    data object Finished : SuggestionTag("#finished", 1)
-    data object Author : SuggestionTag("#author", 2)
-    data class Genre(val name: String) : SuggestionTag("#" + name.lowercase().replace(Regex("\\s+"), "-"), 3)
-    data object MultiSource : SuggestionTag("#multi-source", 4)
-    data object ShortSeries : SuggestionTag("#short", 5)
-    data object LongSeries : SuggestionTag("#long", 5)
-    data object Popular : SuggestionTag("#popular", 6)
-    data object New : SuggestionTag("#new", 6)
-    data object Completed : SuggestionTag("#completed", 7)
-    data object Ongoing : SuggestionTag("#ongoing", 7)
-    data object PinnedSource : SuggestionTag("#pinned-source", 8)
-    data class FromSource(val name: String) : SuggestionTag("#" + name.lowercase().replace(Regex("\\s+"), "-"), 8)
-}
+data class SuggestionTag(val label: String, val order: Int) {
+    companion object {
+        val Searched = SuggestionTag("#searched", 0)
+        val Finished = SuggestionTag("#finished", 1)
+        val Reading = SuggestionTag("#reading", 2)
+        val Trending = SuggestionTag("#trending", 2)
+        val TopRated = SuggestionTag("#top-rated", 2)
+        val MultiPick = SuggestionTag("#multi-pick", 3)
+        val ReadersPick = SuggestionTag("#readers-pick", 4)
+        val SimilarTags = SuggestionTag("#similar-tags", 5)
+        val SameAuthor = SuggestionTag("#same-author", 5)
+        val MangaUpdates = SuggestionTag("#mangaupdates", 9)
 
-/**
- * Turns on the source filter whose name matches [genreName]. Returns false when the source has no such filter.
- */
-fun FilterList.applyGenre(genreName: String): Boolean {
-    for (sourceFilter in this) {
-        if (sourceFilter is Filter.Group<*>) {
-            for (filter in sourceFilter.state) {
-                if (filter is Filter<*> && filter.name.equals(genreName, true)) {
-                    when (filter) {
-                        is Filter.TriState -> filter.state = 1
-                        is Filter.CheckBox -> filter.state = true
-                        else -> {}
-                    }
-                    return true
-                }
-            }
-        } else if (sourceFilter is Filter.Select<*>) {
-            val index = sourceFilter.values.filterIsInstance<String>()
-                .indexOfFirst { it.equals(genreName, true) }
+        fun genre(name: String) = SuggestionTag(hashtag(name), 6)
 
-            if (index != -1) {
-                sourceFilter.state = index
-                return true
-            }
-        }
+        // MangaUpdates writes plurals as "War/s" or "Elf/ves"; the tag drops that ending
+        fun category(name: String) = SuggestionTag(hashtag(name.replace(PLURAL_SUFFIX, "")), 7)
+
+        fun type(name: String) = SuggestionTag(hashtag(name), 8)
+
+        private val PLURAL_SUFFIX = Regex("""/\w{1,3}\b""")
+
+        private fun hashtag(name: String) =
+            "#" + name.lowercase().replace(Regex("[^\\p{L}\\p{N}]+"), "-").trim('-')
     }
-    return false
-}
-
-/**
- * Turns on [status] (e.g. "Completed") in the source's Status filter. Returns false when the source has none.
- */
-fun FilterList.applyStatus(status: String): Boolean {
-    for (sourceFilter in this) {
-        if (!sourceFilter.name.contains("status", ignoreCase = true)) continue
-        if (sourceFilter is Filter.Group<*>) {
-            for (filter in sourceFilter.state) {
-                if (filter is Filter<*> && filter.name.equals(status, true)) {
-                    when (filter) {
-                        is Filter.TriState -> filter.state = 1
-                        is Filter.CheckBox -> filter.state = true
-                        else -> continue
-                    }
-                    return true
-                }
-            }
-        } else if (sourceFilter is Filter.Select<*>) {
-            val index = sourceFilter.values.map { it.toString() }
-                .indexOfFirst { it.equals(status, true) }
-            if (index != -1) {
-                sourceFilter.state = index
-                return true
-            }
-        }
-    }
-    return false
 }

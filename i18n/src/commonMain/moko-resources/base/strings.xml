@@ -1123,4 +1123,10 @@
     <string name="pref_suggestions_record_searches_summary">Not saved in incognito mode</string>
     <string name="pref_suggestions_clear_searches">Clear saved searches</string>
     <string name="pref_suggestions_searches_cleared">Saved searches cleared</string>
+    <!-- For you: UI polish -->
+    <string name="suggestions_open_mangaupdates">Open on MangaUpdates</string>
+    <string name="suggestions_paused_until">MangaUpdates didn\'t answer. Paused until %1$s.</string>
+    <string name="suggestions_limit_until">MangaUpdates request limit reached. More after %1$s.</string>
+    <string name="suggestions_retry_in">Retry in %1$d min</string>
+    <string name="suggestions_ready_again">MangaUpdates can be asked again.</string>
 </resources>

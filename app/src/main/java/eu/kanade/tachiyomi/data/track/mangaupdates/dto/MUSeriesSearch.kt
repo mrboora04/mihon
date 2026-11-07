@@ -22,7 +22,7 @@ data class MUSeriesSearchRequest(
     // Always sent: Mihon's Json leaves out fields still at their default value
     @EncodeDefault
     @SerialName("filter_types")
-    val filterTypes: List<String> = listOf("novel", "drama cd"),
+    val filterTypes: List<String> = listOf("novel", "drama cd", "doujinshi"),
     val orderby: String? = null,
     val perpage: Int? = null,
 )

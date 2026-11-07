@@ -5,13 +5,16 @@ import eu.kanade.tachiyomi.data.track.TrackerManager
 import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MURecommendation
 import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MURecord
 import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUSeriesSearchRequest
+import eu.kanade.tachiyomi.network.HttpException
 import eu.kanade.tachiyomi.util.lang.htmlDecode
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.contentOrNull
 import logcat.LogPriority
 import tachiyomi.core.common.util.system.logcat
 import tachiyomi.domain.library.model.LibraryManga
 import tachiyomi.domain.manga.interactor.GetLibraryManga
 import tachiyomi.domain.track.repository.TrackRepository
+import java.io.IOException
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.days
 
@@ -43,8 +46,12 @@ class SuggestionEngine(
     sealed interface Stop {
         data class LimitReached(val retryIn: Duration) : Stop
 
-        /** MangaUpdates failed; nothing is sent again until [retryIn] has passed. */
-        data class Failed(val retryIn: Duration) : Stop
+        /**
+         * MangaUpdates failed; nothing is sent again until [retryIn] has passed.
+         *
+         * @property reason short cause such as "HTTP 429", shown so failures can be told apart
+         */
+        data class Failed(val retryIn: Duration, val reason: String? = null) : Stop
     }
 
     // region For you
@@ -62,7 +69,18 @@ class SuggestionEngine(
         for (step in pendingForYouWork(context)) {
             if (runner.remaining <= 0) break
             val ok = when (step) {
-                is Work.Search -> runner.run { search(step.query) }
+                is Work.Search -> runner.run { search(step.query) } && run {
+                    val hitId = cache.read { data ->
+                        data.searches[step.query.lowercase()]?.results?.firstOrNull(::isComic)?.id
+                            ?.takeIf { it !in data.series }
+                    }
+                    if (hitId == null || runner.remaining <= 0) {
+                        true
+                    } else {
+                        result = snapshot()
+                        runner.run { fetchSeries(hitId) }
+                    }
+                }
                 is Work.Fetch -> runner.run { fetchSeries(step.seriesId) }
                 is Work.Author -> runner.run { fetchAuthor(step.authorId) }
                 is Work.Match -> runner.run { match(step.seed) } && run {
@@ -86,7 +104,15 @@ class SuggestionEngine(
         val now = System.currentTimeMillis()
         buildList {
             context.searches.forEach { query ->
-                if (data.searches[query.lowercase()].isStale(now, SERIES_TTL)) add(Work.Search(query))
+                val cached = data.searches[query.lowercase()]
+                if (cached.isStale(now, SERIES_TTL)) {
+                    add(Work.Search(query))
+                } else {
+                    // A search stands for the title the user was looking for: use its recommendations
+                    cached?.results?.firstOrNull(::isComic)?.let { hit ->
+                        if (data.series[hit.id].isStale(now, SERIES_TTL)) add(Work.Fetch(hit.id))
+                    }
+                }
             }
             context.seeds.forEach { seed ->
                 when (val seriesId = context.seriesIdOf(seed, data)) {
@@ -109,17 +135,40 @@ class SuggestionEngine(
     private suspend fun rankForYou(context: LibraryContext): ForYouResult = cache.read { data ->
         val picks = Picks(context, data)
 
+        // The best match for a search, and what readers recommend for it; not the other hits, which
+        // are mostly spin-offs of the same title
         context.searches.forEach { query ->
-            data.searches[query.lowercase()]?.results?.take(SEARCH_RESULTS_USED)?.forEach { entry ->
-                picks.add(entry, SuggestionTag.Searched, score = 3)
+            val hit = data.searches[query.lowercase()]?.results?.firstOrNull(::isComic) ?: return@forEach
+            picks.add(hit, SuggestionTag.Searched, score = 3, searched = query)
+            data.series[hit.id]?.let { series ->
+                series.readersPicks.forEach { entry ->
+                    picks.add(
+                        entry,
+                        SuggestionTag.Searched,
+                        SuggestionTag.ReadersPick,
+                        score = entry.weight * 2,
+                        searched = query,
+                    )
+                }
+                series.similar.forEach { entry ->
+                    picks.add(entry, SuggestionTag.Searched, SuggestionTag.SimilarTags, score = 1, searched = query)
+                }
             }
         }
         var checkedTitles = 0
         context.seeds.forEach { seed ->
             val series = context.seriesIdOf(seed, data)?.let { data.series[it] } ?: return@forEach
             checkedTitles++
-            val seedWeight = if (seed.finished) 2 else 1
-            val reason = if (seed.finished) SuggestionTag.Finished else SuggestionTag.Reading
+            val seedWeight = when (seed.kind) {
+                SeedKind.FINISHED -> 3
+                SeedKind.READING -> 2
+                SeedKind.SAVED -> 1
+            }
+            val reason = when (seed.kind) {
+                SeedKind.FINISHED -> SuggestionTag.Finished
+                SeedKind.READING -> SuggestionTag.Reading
+                SeedKind.SAVED -> SuggestionTag.Saved
+            }
             series.readersPicks.forEach { entry ->
                 picks.add(
                     entry,
@@ -240,16 +289,24 @@ class SuggestionEngine(
                 limiter.request { block() }
                 true
             } catch (e: ForYouLimiter.LimitReachedException) {
-                stop = if (e.afterFailure) Stop.Failed(e.retryIn) else Stop.LimitReached(e.retryIn)
+                stop = if (e.afterFailure) Stop.Failed(e.retryIn, e.reason) else Stop.LimitReached(e.retryIn)
                 false
             } catch (e: Exception) {
                 // Covers 429/5xx and timeouts alike: back off for a while rather than keep asking
                 logcat(LogPriority.WARN, e) { "For you: MangaUpdates request failed, pausing requests" }
-                limiter.pauseAfterFailure()
-                stop = Stop.Failed(ForYouLimiter.FAILURE_PAUSE)
+                val reason = failureReason(e)
+                limiter.pauseAfterFailure(reason)
+                stop = Stop.Failed(ForYouLimiter.FAILURE_PAUSE, reason)
                 false
             }
         }
+    }
+
+    private fun failureReason(e: Exception): String = when (e) {
+        is HttpException -> "HTTP ${e.code}"
+        is SerializationException -> "unexpected reply"
+        is IOException -> "no connection"
+        else -> e::class.simpleName ?: "error"
     }
 
     private suspend fun match(seed: Seed) {
@@ -298,13 +355,12 @@ class SuggestionEngine(
     }
 
     private suspend fun search(query: String) {
-        val results = mangaUpdates.searchSeries(query).mapNotNull(::toEntry)
+        val results = mangaUpdates.searchSeries(MUSeriesSearchRequest(search = query)).mapNotNull(::toEntry)
         cache.edit { it.searches[query.lowercase()] = SuggestionCache.Search(System.currentTimeMillis(), results) }
     }
 
     private fun toEntry(record: MURecord): SuggestionCache.Entry? = SuggestionCache.Entry(
-        // The search excludes novels, but drop any that slip through: For you is for comics
-        id = record.seriesId?.takeUnless { record.type.equals("Novel", ignoreCase = true) } ?: return null,
+        id = record.seriesId ?: return null,
         title = record.title?.htmlDecode() ?: return null,
         url = record.url,
         cover = record.image?.url?.original,
@@ -316,8 +372,6 @@ class SuggestionEngine(
 
     private fun toEntry(rec: MURecommendation): SuggestionCache.Entry? {
         val title = rec.seriesName?.htmlDecode() ?: return null
-        // Recommendation lists can include novels; MangaUpdates marks them in the name
-        if (NOVEL_MARKER.containsMatchIn(title)) return null
         return SuggestionCache.Entry(
             id = rec.seriesId ?: return null,
             title = title,
@@ -345,19 +399,25 @@ class SuggestionEngine(
         val finishedIds = library
             .filter { it.totalChapters > 0 && it.readCount >= it.totalChapters }
             .mapTo(HashSet()) { it.id }
+        fun kindOf(item: LibraryManga) = when {
+            item.id in finishedIds -> SeedKind.FINISHED
+            item.hasStarted -> SeedKind.READING
+            else -> SeedKind.SAVED
+        }
+        val wanted = buildSet {
+            if (SuggestionSignal.FINISHED in signals) add(SeedKind.FINISHED)
+            if (SuggestionSignal.READING in signals) add(SeedKind.READING)
+            if (SuggestionSignal.SAVED in signals) add(SeedKind.SAVED)
+        }
         return library
-            .filter { item ->
-                val finished = item.id in finishedIds
-                (finished && SuggestionSignal.FINISHED in signals) ||
-                    (!finished && item.hasStarted && SuggestionSignal.READING in signals)
-            }
+            .filter { kindOf(it) in wanted }
             .sortedWith(
-                compareByDescending<LibraryManga> { it.id in finishedIds }
+                compareBy<LibraryManga> { kindOf(it).ordinal }
                     .thenByDescending { it.lastRead }
-                    .thenByDescending { it.readCount },
+                    .thenByDescending { it.manga.favoriteAt },
             )
             .take(MAX_SEEDS)
-            .map { Seed(it.manga.id, it.manga.title, finished = it.id in finishedIds) }
+            .map { Seed(it.manga.id, it.manga.title, kindOf(it)) }
     }
 
     private class LibraryContext(
@@ -400,13 +460,16 @@ class SuggestionEngine(
             vararg tags: SuggestionTag,
             score: Int,
             because: String? = null,
+            searched: String? = null,
             rank: Int? = null,
         ) {
+            if (!isComic(entry)) return
             if (entry.id in librarySeriesIds || entry.title.normalized() in context.libraryTitles) return
             val c = candidates.getOrPut(entry.id) { Candidate(entry) }
             c.tags += tags
             c.score += score
             because?.let { c.because += it }
+            searched?.let { c.searched += it }
             if (rank != null) c.rank = rank
         }
 
@@ -433,6 +496,7 @@ class SuggestionEngine(
                     year = c.entry.year,
                     rank = c.rank,
                     because = c.because.toList(),
+                    becauseSearched = c.searched.toList(),
                     tags = c.tags.sortedBy { it.order },
                 )
             }
@@ -454,7 +518,9 @@ class SuggestionEngine(
         val stop: Stop? = null,
     )
 
-    private data class Seed(val mangaId: Long, val title: String, val finished: Boolean)
+    private enum class SeedKind { FINISHED, READING, SAVED }
+
+    private data class Seed(val mangaId: Long, val title: String, val kind: SeedKind)
 
     private sealed interface Work {
         data class Match(val seed: Seed) : Work
@@ -466,6 +532,7 @@ class SuggestionEngine(
     private class Candidate(val entry: SuggestionCache.Entry) {
         val tags = LinkedHashSet<SuggestionTag>()
         val because = LinkedHashSet<String>()
+        val searched = LinkedHashSet<String>()
         var score = 0
         var rank: Int? = null
     }
@@ -475,7 +542,6 @@ class SuggestionEngine(
         private const val MAX_SEEDS = 40
         private const val MAX_AUTHORS = 8
         private const val MAX_SEARCH_SEEDS = 3
-        private const val SEARCH_RESULTS_USED = 5
         private const val MIN_CATEGORY_VOTES = 3
         private const val MAX_CATEGORIES_PER_SERIES = 8
         private const val MAX_YOUR_CATEGORIES = 6
@@ -483,11 +549,23 @@ class SuggestionEngine(
         private val SERIES_TTL = 7.days
         private val TRENDING_TTL = 1.days
         private val TOP_RATED_TTL = 7.days
-        private val NOVEL_MARKER = Regex("""\((Light )?Novel\)""", RegexOption.IGNORE_CASE)
     }
 }
 
 private fun String.normalized(): String = lowercase().filter(Char::isLetterOrDigit)
+
+private val NOVEL_MARKER = Regex("""\((Light )?Novel\)""", RegexOption.IGNORE_CASE)
+private val DOUJINSHI_MARKER = Regex("""\bdj - """, RegexOption.IGNORE_CASE)
+private val EXCLUDED_TYPES = setOf("Novel", "Doujinshi")
+
+/**
+ * For you only suggests comics. MangaUpdates marks novels and doujinshi in the type, or in the
+ * name when the type isn't sent (recommendation lists).
+ */
+private fun isComic(entry: SuggestionCache.Entry) =
+    entry.type !in EXCLUDED_TYPES &&
+        !NOVEL_MARKER.containsMatchIn(entry.title) &&
+        !DOUJINSHI_MARKER.containsMatchIn(entry.title)
 
 private fun SuggestionCache.Series?.isStale(now: Long, ttl: Duration) =
     this == null || now - fetchedAt > ttl.inWholeMilliseconds
@@ -505,6 +583,8 @@ data class Suggestion(
     /** Position in a trending list, 1-based. */
     val rank: Int?,
     val because: List<String>,
+    /** Searches this was found through, for a "Because you searched…" line. */
+    val becauseSearched: List<String> = emptyList(),
     val tags: List<SuggestionTag>,
 )
 
@@ -516,6 +596,7 @@ data class SuggestionTag(val label: String, val order: Int) {
         val Searched = SuggestionTag("#searched", 0)
         val Finished = SuggestionTag("#finished", 1)
         val Reading = SuggestionTag("#reading", 2)
+        val Saved = SuggestionTag("#saved", 2)
         val Trending = SuggestionTag("#trending", 2)
         val TopRated = SuggestionTag("#top-rated", 2)
         val MultiPick = SuggestionTag("#multi-pick", 3)

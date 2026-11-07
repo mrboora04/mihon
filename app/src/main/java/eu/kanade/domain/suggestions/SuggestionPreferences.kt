@@ -62,6 +62,12 @@ class SuggestionPreferences(
         0L,
     )
 
+    /** Why requests were paused, shown with the pause message. */
+    val pauseReason: Preference<String> = preferenceStore.getString(
+        Preference.appStateKey("for_you_pause_reason"),
+        "",
+    )
+
     val lastManualRefresh: Preference<Long> = preferenceStore.getLong(
         Preference.appStateKey("for_you_last_refresh"),
         0L,
@@ -76,4 +82,7 @@ enum class SuggestionSignal {
     SEARCHED,
     FINISHED,
     READING,
+
+    /** In the library but not started yet. */
+    SAVED,
 }

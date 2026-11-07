@@ -31,13 +31,20 @@ class ForYouLimiter(
     class LimitReachedException(
         val retryIn: Duration,
         val afterFailure: Boolean = false,
+        val reason: String? = null,
     ) : Exception("MangaUpdates request limit reached")
 
     /** Runs [block] as one MangaUpdates request, or throws [LimitReachedException] without running it. */
     suspend fun <T> request(block: suspend () -> T): T = mutex.withLock {
         val now = System.currentTimeMillis()
         val pausedFor = preferences.pausedUntil.get() - now
-        if (pausedFor > 0) throw LimitReachedException(pausedFor.milliseconds, afterFailure = true)
+        if (pausedFor > 0) {
+            throw LimitReachedException(
+                pausedFor.milliseconds,
+                afterFailure = true,
+                reason = preferences.pauseReason.get().ifBlank { null },
+            )
+        }
 
         val log = preferences.getRequestLog().filter { now - it < DAY_MS }
         val lastHour = log.filter { now - it < HOUR_MS }
@@ -55,7 +62,8 @@ class ForYouLimiter(
     }
 
     /** Stops all requests for [FAILURE_PAUSE], like honouring a Retry-After, so a retry can't hammer the API. */
-    fun pauseAfterFailure() {
+    fun pauseAfterFailure(reason: String) {
+        preferences.pauseReason.set(reason)
         preferences.pausedUntil.set(System.currentTimeMillis() + FAILURE_PAUSE.inWholeMilliseconds)
     }
 

@@ -1129,4 +1129,7 @@
     <string name="suggestions_limit_until">MangaUpdates request limit reached. More after %1$s.</string>
     <string name="suggestions_retry_in">Retry in %1$d min</string>
     <string name="suggestions_ready_again">MangaUpdates can be asked again.</string>
+    <string name="suggestions_paused_until_reason">MangaUpdates didn\'t answer (%1$s). Paused until %2$s.</string>
+    <string name="suggestions_because_searched">Because you searched %1$s</string>
+    <string name="suggestion_signal_saved">Titles saved in your library (#saved)</string>
 </resources>

@@ -449,6 +449,8 @@ private fun StopMessage(
             text = when {
                 ready -> stringResource(MR.strings.suggestions_ready_again)
                 stop is SuggestionEngine.Stop.LimitReached -> stringResource(MR.strings.suggestions_limit_until, time)
+                stop is SuggestionEngine.Stop.Failed && stop.reason != null ->
+                    stringResource(MR.strings.suggestions_paused_until_reason, stop.reason, time)
                 else -> stringResource(MR.strings.suggestions_paused_until, time)
             },
             style = MaterialTheme.typography.bodyMedium,
@@ -516,6 +518,18 @@ private fun SuggestionItem(
             if (suggestion.because.isNotEmpty()) {
                 Text(
                     text = stringResource(MR.strings.suggestions_because, suggestion.because.take(2).joinToString()),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (suggestion.becauseSearched.isNotEmpty()) {
+                Text(
+                    text = stringResource(
+                        MR.strings.suggestions_because_searched,
+                        suggestion.becauseSearched.take(2).joinToString(),
+                    ),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,

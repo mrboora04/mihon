@@ -47,6 +47,7 @@ object SettingsPersonalisedScreen : SearchableSettings {
                         entries = mapOf(
                             SuggestionSignal.FINISHED to stringResource(MR.strings.suggestion_signal_finished),
                             SuggestionSignal.READING to stringResource(MR.strings.suggestion_signal_reading),
+                            SuggestionSignal.SAVED to stringResource(MR.strings.suggestion_signal_saved),
                             SuggestionSignal.SEARCHED to stringResource(MR.strings.suggestion_signal_searched),
                         ),
                         title = stringResource(MR.strings.pref_suggestions_signals),

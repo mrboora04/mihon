@@ -16,7 +16,6 @@ import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUSearchResultItem
 import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUSeriesSearchRequest
 import eu.kanade.tachiyomi.network.DELETE
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.HttpException
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.PUT
 import eu.kanade.tachiyomi.network.await
@@ -195,14 +194,12 @@ class MangaUpdatesApi(
                 val response = client.newCall(GET(url))
                     .await()
 
-                when {
-                    response.code == 404 -> null
-                    // Don't parse an error body (e.g. 429) as an empty series
-                    !response.isSuccessful -> {
-                        response.close()
-                        throw HttpException(response.code)
-                    }
-                    else -> response.parseAs<MURecord>()
+                // Don't parse an error body (e.g. 429) as an empty series
+                if (response.code == 404) {
+                    response.close()
+                    null
+                } else {
+                    response.requireSuccess().parseAs<MURecord>()
                 }
             }
         }
@@ -222,7 +219,8 @@ class MangaUpdatesApi(
                         body = encodeToString(MUSeriesSearchRequest.serializer(), request).toRequestBody(CONTENT_TYPE),
                     ),
                 )
-                    .awaitSuccess()
+                    .await()
+                    .requireSuccess()
                     .parseAs<MUSearchResult>()
                     .results
             }
@@ -238,7 +236,8 @@ class MangaUpdatesApi(
                         body = """{"orderby":"year"}""".toRequestBody(CONTENT_TYPE),
                     ),
                 )
-                    .awaitSuccess()
+                    .await()
+                    .requireSuccess()
                     .parseAs<MUAuthorSeriesList>()
                     .seriesList
                     .orEmpty()

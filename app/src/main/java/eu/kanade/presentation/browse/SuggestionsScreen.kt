@@ -8,8 +8,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
@@ -65,7 +63,6 @@ import mihon.icons.materialsymbols.automirroredrounded.OpenInNew
 import mihon.icons.materialsymbols.rounded.KeyboardArrowDown
 import mihon.icons.materialsymbols.rounded.Person
 import tachiyomi.i18n.MR
-import tachiyomi.presentation.core.components.Pill
 import tachiyomi.presentation.core.components.ScrollbarLazyColumn
 import tachiyomi.presentation.core.components.material.padding
 import tachiyomi.presentation.core.i18n.stringResource
@@ -122,7 +119,7 @@ fun SuggestionsScreen(
             items(items = state.visibleItems, key = { it.seriesId }) { suggestion ->
                 SuggestionItem(
                     suggestion = suggestion,
-                    selectedTag = state.selectedTag,
+                    reason = reasonLine(state, suggestion),
                     onClick = { onClickItem(suggestion) },
                     onLongClick = { onLongClickItem(suggestion) },
                 )
@@ -469,11 +466,37 @@ private fun StopMessage(
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
+/**
+ * The one line on a card saying why it's there. The hashtags stay in the filter chips above the
+ * list instead of being repeated on every card.
+ */
+@Composable
+private fun reasonLine(state: SuggestionsViewModel.State, suggestion: Suggestion): String? = when (state.section) {
+    Section.FOR_YOU -> when {
+        suggestion.because.isNotEmpty() ->
+            stringResource(MR.strings.suggestions_because, suggestion.because.take(2).joinToString())
+        suggestion.becauseSearched.isNotEmpty() ->
+            stringResource(MR.strings.suggestions_because_searched, suggestion.becauseSearched.take(2).joinToString())
+        else -> null
+    }
+    Section.TRENDING -> suggestion.rank?.let { rank ->
+        stringResource(
+            when (state.trendingPeriod) {
+                TrendingPeriod.WEEK -> MR.strings.suggestions_rank_week
+                TrendingPeriod.MONTH -> MR.strings.suggestions_rank_month
+                TrendingPeriod.THREE_MONTHS -> MR.strings.suggestions_rank_three_months
+            },
+            rank,
+        )
+    }
+    Section.TOP_RATED -> state.topRatedBasis.takeIf { it.isNotEmpty() }
+        ?.let { stringResource(MR.strings.suggestions_top_rated_in, it.joinToString()) }
+}
+
 @Composable
 private fun SuggestionItem(
     suggestion: Suggestion,
-    selectedTag: SuggestionTag?,
+    reason: String?,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
 ) {
@@ -499,7 +522,7 @@ private fun SuggestionItem(
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             Text(
-                text = listOfNotNull(suggestion.rank?.let { "#$it" }, suggestion.title).joinToString(" "),
+                text = suggestion.title,
                 style = MaterialTheme.typography.titleSmall,
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
@@ -515,46 +538,14 @@ private fun SuggestionItem(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            if (suggestion.because.isNotEmpty()) {
+            if (reason != null) {
                 Text(
-                    text = stringResource(MR.strings.suggestions_because, suggestion.because.take(2).joinToString()),
+                    text = reason,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
+                    maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
-            }
-            if (suggestion.becauseSearched.isNotEmpty()) {
-                Text(
-                    text = stringResource(
-                        MR.strings.suggestions_because_searched,
-                        suggestion.becauseSearched.take(2).joinToString(),
-                    ),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-            // Plain labels: they're too small to be good tap targets, the chips above do the filtering
-            FlowRow(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                suggestion.tags.forEach { tag ->
-                    val selected = tag == selectedTag
-                    Pill(
-                        text = tag.label,
-                        color = if (selected) {
-                            MaterialTheme.colorScheme.primary
-                        } else {
-                            MaterialTheme.colorScheme.secondaryContainer
-                        },
-                        contentColor = if (selected) {
-                            MaterialTheme.colorScheme.onPrimary
-                        } else {
-                            MaterialTheme.colorScheme.onSecondaryContainer
-                        },
-                        style = MaterialTheme.typography.labelMedium,
-                    )
-                }
             }
         }
         // Same as a long-press, but visible, so the MangaUpdates page can be found without guessing

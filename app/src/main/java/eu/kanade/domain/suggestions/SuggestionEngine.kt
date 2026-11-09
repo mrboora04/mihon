@@ -2,11 +2,13 @@ package eu.kanade.domain.suggestions
 
 import dev.zacsweers.metro.Inject
 import eu.kanade.tachiyomi.data.track.TrackerManager
+import eu.kanade.tachiyomi.data.track.mangaupdates.MangaUpdatesHttpException
 import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MURecommendation
 import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MURecord
 import eu.kanade.tachiyomi.data.track.mangaupdates.dto.MUSeriesSearchRequest
 import eu.kanade.tachiyomi.network.HttpException
 import eu.kanade.tachiyomi.util.lang.htmlDecode
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.contentOrNull
 import logcat.LogPriority
@@ -15,6 +17,7 @@ import tachiyomi.domain.library.model.LibraryManga
 import tachiyomi.domain.manga.interactor.GetLibraryManga
 import tachiyomi.domain.track.repository.TrackRepository
 import java.io.IOException
+import java.net.SocketTimeoutException
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.days
 
@@ -69,7 +72,7 @@ class SuggestionEngine(
         for (step in pendingForYouWork(context)) {
             if (runner.remaining <= 0) break
             val ok = when (step) {
-                is Work.Search -> runner.run { search(step.query) } && run {
+                is Work.Search -> runner.run(onSkip = { saveEmptySearch(step.query) }) { search(step.query) } && run {
                     val hitId = cache.read { data ->
                         data.searches[step.query.lowercase()]?.results?.firstOrNull(::isComic)?.id
                             ?.takeIf { it !in data.series }
@@ -78,19 +81,19 @@ class SuggestionEngine(
                         true
                     } else {
                         result = snapshot()
-                        runner.run { fetchSeries(hitId) }
+                        runner.run(onSkip = { saveEmptySeries(hitId) }) { fetchSeries(hitId) }
                     }
                 }
-                is Work.Fetch -> runner.run { fetchSeries(step.seriesId) }
-                is Work.Author -> runner.run { fetchAuthor(step.authorId) }
-                is Work.Match -> runner.run { match(step.seed) } && run {
+                is Work.Fetch -> runner.run(onSkip = { saveEmptySeries(step.seriesId) }) { fetchSeries(step.seriesId) }
+                is Work.Author -> runner.run(onSkip = { saveEmptyAuthor(step.authorId) }) { fetchAuthor(step.authorId) }
+                is Work.Match -> runner.run(onSkip = { saveNoMatch(step.seed) }) { match(step.seed) } && run {
                     // Fetch its recommendations right away if the match was found
                     val seriesId = cache.read { it.matches[step.seed.mangaId] }
                     if (seriesId == null || seriesId == SuggestionCache.NO_MATCH || runner.remaining <= 0) {
                         true
                     } else {
                         result = snapshot()
-                        runner.run { fetchSeries(seriesId) }
+                        runner.run(onSkip = { saveEmptySeries(seriesId) }) { fetchSeries(seriesId) }
                     }
                 }
             }
@@ -222,7 +225,9 @@ class SuggestionEngine(
         val context = libraryContext()
         val genres = cache.read { context.topGenres(it) }.take(2)
         if (category == null && genres.isEmpty()) return ListResult(emptyList(), needsLibrary = true)
+        val basis = if (category != null) listOf(SuggestionTag.categoryName(category)) else genres
         return loadList(
+            basis = basis,
             key = if (category != null) "top:category:$category" else "top:genres:${genres.joinToString("+")}",
             ttl = TOP_RATED_TTL,
             tags = listOfNotNull(SuggestionTag.TopRated, category?.let(SuggestionTag::category)),
@@ -240,6 +245,7 @@ class SuggestionEngine(
     }
 
     private suspend fun loadList(
+        basis: List<String> = emptyList(),
         key: String,
         ttl: Duration,
         tags: List<SuggestionTag>,
@@ -263,7 +269,7 @@ class SuggestionEngine(
             data.lists[key]?.results?.forEachIndexed { index, entry ->
                 picks.add(entry, *tags.toTypedArray(), score = 1000 - index, rank = (index + 1).takeIf { ranked })
             }
-            ListResult(picks.ranked(), stop = stop)
+            ListResult(picks.ranked(), basis = basis, stop = stop)
         }
     }
 
@@ -275,38 +281,63 @@ class SuggestionEngine(
 
     fun markManualRefresh() = limiter.markManualRefresh()
 
-    /** Runs requests through the limiter until the budget runs out or one fails. */
+    /**
+     * Runs requests through the limiter until the budget runs out or one fails in a way that may
+     * pass (then everything pauses). A failure that won't pass by retrying skips just that request:
+     * [run]'s `onSkip` saves an empty answer so it isn't asked again until it's due.
+     */
     private inner class Runner(budget: Int) {
         var remaining = budget
             private set
         var stop: Stop? = null
             private set
 
-        suspend fun run(block: suspend () -> Unit): Boolean {
+        suspend fun run(onSkip: suspend () -> Unit = {}, block: suspend () -> Unit): Boolean {
             if (remaining <= 0) return false
             remaining--
             return try {
                 limiter.request { block() }
                 true
+            } catch (e: CancellationException) {
+                // Leaving the tab cancels the load; that's not a MangaUpdates failure
+                throw e
             } catch (e: ForYouLimiter.LimitReachedException) {
                 stop = if (e.afterFailure) Stop.Failed(e.retryIn, e.reason) else Stop.LimitReached(e.retryIn)
                 false
             } catch (e: Exception) {
-                // Covers 429/5xx and timeouts alike: back off for a while rather than keep asking
-                logcat(LogPriority.WARN, e) { "For you: MangaUpdates request failed, pausing requests" }
-                val reason = failureReason(e)
-                limiter.pauseAfterFailure(reason)
-                stop = Stop.Failed(ForYouLimiter.FAILURE_PAUSE, reason)
-                false
+                when (val failure = classifyFailure(e)) {
+                    is Failure.Transient -> {
+                        logcat(LogPriority.WARN, e) { "Discover: MangaUpdates request failed, pausing requests" }
+                        val pause = limiter.pauseAfterFailure(failure.reason, failure.retryAfter)
+                        stop = Stop.Failed(pause, failure.reason)
+                        false
+                    }
+                    is Failure.Permanent -> {
+                        logcat(LogPriority.WARN, e) {
+                            "Discover: skipping one MangaUpdates request (${failure.reason})"
+                        }
+                        onSkip()
+                        true
+                    }
+                }
             }
         }
     }
 
-    private fun failureReason(e: Exception): String = when (e) {
-        is HttpException -> "HTTP ${e.code}"
-        is SerializationException -> "unexpected reply"
-        is IOException -> "no connection"
-        else -> e::class.simpleName ?: "error"
+    private suspend fun saveEmptySeries(seriesId: Long) = cache.edit {
+        it.series[seriesId] = SuggestionCache.Series(System.currentTimeMillis(), emptyList(), emptyList())
+    }
+
+    private suspend fun saveEmptySearch(query: String) = cache.edit {
+        it.searches[query.lowercase()] = SuggestionCache.Search(System.currentTimeMillis(), emptyList())
+    }
+
+    private suspend fun saveEmptyAuthor(authorId: Long) = cache.edit {
+        it.authors[authorId] = SuggestionCache.Search(System.currentTimeMillis(), emptyList())
+    }
+
+    private suspend fun saveNoMatch(seed: Seed) = cache.edit {
+        it.matches[seed.mangaId] = SuggestionCache.NO_MATCH
     }
 
     private suspend fun match(seed: Seed) {
@@ -513,6 +544,8 @@ class SuggestionEngine(
 
     data class ListResult(
         val suggestions: List<Suggestion>,
+        /** What the list was built from, e.g. the genres or category for Top rated. */
+        val basis: List<String> = emptyList(),
         /** Top rated needs a few library titles looked up first, to know the user's genres. */
         val needsLibrary: Boolean = false,
         val stop: Stop? = null,
@@ -554,6 +587,35 @@ class SuggestionEngine(
 
 private fun String.normalized(): String = lowercase().filter(Char::isLetterOrDigit)
 
+/** Whether a failed request may succeed later (pause and back off) or won't (skip it). */
+internal sealed interface Failure {
+    val reason: String
+
+    data class Transient(override val reason: String, val retryAfter: Duration? = null) : Failure
+
+    data class Permanent(override val reason: String) : Failure
+}
+
+/**
+ * Network trouble, 408, 429 and 5xx may pass, so requests pause. Other 4xx and replies that can't
+ * be read won't change by asking again, so only that request is skipped.
+ */
+internal fun classifyFailure(e: Exception): Failure = when (e) {
+    is MangaUpdatesHttpException -> classifyStatus(e.code, e.retryAfter)
+    is HttpException -> classifyStatus(e.code, null)
+    is SerializationException -> Failure.Permanent("unexpected reply")
+    is SocketTimeoutException -> Failure.Transient("timed out")
+    is IOException -> Failure.Transient("no connection")
+    else -> Failure.Permanent(e::class.simpleName ?: "error")
+}
+
+private fun classifyStatus(code: Int, retryAfter: Duration?): Failure =
+    if (code == 408 || code == 429 || code in 500..599) {
+        Failure.Transient("HTTP $code", retryAfter)
+    } else {
+        Failure.Permanent("HTTP $code")
+    }
+
 private val NOVEL_MARKER = Regex("""\((Light )?Novel\)""", RegexOption.IGNORE_CASE)
 private val DOUJINSHI_MARKER = Regex("""\bdj - """, RegexOption.IGNORE_CASE)
 private val EXCLUDED_TYPES = setOf("Novel", "Doujinshi")
@@ -562,7 +624,7 @@ private val EXCLUDED_TYPES = setOf("Novel", "Doujinshi")
  * For you only suggests comics. MangaUpdates marks novels and doujinshi in the type, or in the
  * name when the type isn't sent (recommendation lists).
  */
-private fun isComic(entry: SuggestionCache.Entry) =
+internal fun isComic(entry: SuggestionCache.Entry) =
     entry.type !in EXCLUDED_TYPES &&
         !NOVEL_MARKER.containsMatchIn(entry.title) &&
         !DOUJINSHI_MARKER.containsMatchIn(entry.title)
@@ -608,7 +670,10 @@ data class SuggestionTag(val label: String, val order: Int) {
         fun genre(name: String) = SuggestionTag(hashtag(name), 6)
 
         // MangaUpdates writes plurals as "War/s" or "Elf/ves"; the tag drops that ending
-        fun category(name: String) = SuggestionTag(hashtag(name.replace(PLURAL_SUFFIX, "")), 7)
+        fun category(name: String) = SuggestionTag(hashtag(categoryName(name)), 7)
+
+        /** "War/s" -> "War", "Elf/ves" -> "Elf"; "Travel/Journey" is left alone. */
+        fun categoryName(name: String) = name.replace(PLURAL_SUFFIX, "").trim()
 
         fun type(name: String) = SuggestionTag(hashtag(name), 8)
 

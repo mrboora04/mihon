@@ -13,6 +13,7 @@ import kotlinx.serialization.json.Json
 import logcat.LogPriority
 import tachiyomi.core.common.util.system.logcat
 import java.io.File
+import kotlin.time.Duration.Companion.days
 
 /**
  * What MangaUpdates has told us, kept on the device so the For you tab can be opened again
@@ -52,6 +53,7 @@ class SuggestionCache(
                 null
             }
         } ?: Data()
+        loaded.pruneOlderThan(System.currentTimeMillis() - KEEP_FOR.inWholeMilliseconds)
         data = loaded
         return loaded
     }
@@ -76,7 +78,18 @@ class SuggestionCache(
         val authors: MutableMap<Long, Search> = mutableMapOf(),
         /** A list key (trending period, top-rated query) -> its results, in MangaUpdates' order. */
         val lists: MutableMap<String, Search> = mutableMapOf(),
-    )
+    ) {
+        /**
+         * Drops answers nothing has needed for a long time, so the file stays small. Anything still
+         * in use is refreshed long before this. Title matches are tiny and kept.
+         */
+        fun pruneOlderThan(cutoff: Long) {
+            series.values.removeAll { it.fetchedAt < cutoff }
+            searches.values.removeAll { it.fetchedAt < cutoff }
+            authors.values.removeAll { it.fetchedAt < cutoff }
+            lists.values.removeAll { it.fetchedAt < cutoff }
+        }
+    }
 
     @Serializable
     data class Series(
@@ -110,5 +123,6 @@ class SuggestionCache(
 
     companion object {
         const val NO_MATCH = -1L
+        private val KEEP_FOR = 30.days
     }
 }

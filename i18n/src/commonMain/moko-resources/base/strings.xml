@@ -1088,13 +1088,14 @@
     <string name="donationCampaign.dismiss">Dismiss</string>
     <!-- Suggestions -->
     <string name="label_suggestions">For you</string>
+    <string name="label_discover">Discover</string>
     <string name="pref_category_personalised">Personalised</string>
-    <string name="pref_personalised_summary">For you tab, signals, saved searches</string>
+    <string name="pref_personalised_summary">Discover tab, signals, saved searches</string>
     <string name="suggestions_empty">Nothing new to suggest yet. MangaUpdates may not know your titles, or everything recommended is already in your library.</string>
     <string name="suggestions_failed">Couldn\'t build suggestions</string>
     <string name="suggestions_no_history">Read or finish something in your library, or search for a title, and recommendations will appear here</string>
-    <string name="pref_suggestions_enabled">Show For you tab</string>
-    <string name="pref_suggestions_enabled_summary">Adds a For you tab to Browse</string>
+    <string name="pref_suggestions_enabled">Show Discover tab</string>
+    <string name="pref_suggestions_enabled_summary">Adds a Discover tab to Browse: For you, Trending and Top rated</string>
     <string name="pref_suggestions_signals">Suggest based on</string>
     <string name="pref_suggestions_info">For you asks MangaUpdates what readers recommend for titles in your library. Only titles are sent, a few at a time, and answers are kept for a week. Manga sites are only searched when you tap a suggestion.</string>
     <string name="suggestion_signal_searched">Recent searches (#searched)</string>
@@ -1105,6 +1106,10 @@
     <string name="pref_suggestions_cache_cleared">MangaUpdates answers cleared</string>
     <string name="suggestions_credit">Recommendations from MangaUpdates</string>
     <string name="suggestions_because">Because you read %1$s</string>
+    <string name="suggestions_rank_week">#%1$d on MangaUpdates this week</string>
+    <string name="suggestions_rank_month">#%1$d on MangaUpdates this month</string>
+    <string name="suggestions_rank_three_months">#%1$d on MangaUpdates over 3 months</string>
+    <string name="suggestions_top_rated_in">Top rated on MangaUpdates in %1$s</string>
     <string name="suggestions_loading_more">Asking MangaUpdates about more of your titles…</string>
     <string name="suggestions_slow_down">MangaUpdates didn\'t answer. Paused for about %1$d min so it isn\'t asked too often.</string>
     <string name="suggestions_load_more">Load more</string>

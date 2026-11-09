@@ -12,6 +12,7 @@ import eu.kanade.domain.suggestions.Suggestion
 import eu.kanade.domain.suggestions.SuggestionEngine
 import eu.kanade.domain.suggestions.SuggestionEngine.TrendingPeriod
 import eu.kanade.domain.suggestions.SuggestionTag
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
@@ -108,6 +109,9 @@ class SuggestionsViewModel(
                     }
                 }
                 state.update { it.copy(isLoading = false) }
+            } catch (e: CancellationException) {
+                // A newer load replaced this one; it isn't a failure
+                throw e
             } catch (e: Exception) {
                 logcat(LogPriority.ERROR, e)
                 state.update { it.copy(isLoading = false, failed = true) }
@@ -157,6 +161,9 @@ class SuggestionsViewModel(
             Section.TRENDING -> trending[trendingPeriod]?.stop
             Section.TOP_RATED -> topRated[topRatedCategory]?.stop
         }
+
+        /** What the shown Top rated list is based on: the user's genres, or the chosen category. */
+        val topRatedBasis: List<String> = topRated[topRatedCategory]?.basis.orEmpty()
 
         val needsLibrary: Boolean = section == Section.TOP_RATED &&
             topRated[topRatedCategory]?.needsLibrary == true

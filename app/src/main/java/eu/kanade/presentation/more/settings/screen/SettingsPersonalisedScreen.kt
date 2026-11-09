@@ -35,7 +35,7 @@ object SettingsPersonalisedScreen : SearchableSettings {
 
         return listOf(
             Preference.PreferenceGroup(
-                title = stringResource(MR.strings.label_suggestions),
+                title = stringResource(MR.strings.label_discover),
                 preferenceItems = listOf(
                     Preference.PreferenceItem.SwitchPreference(
                         preference = preferences.enabled,

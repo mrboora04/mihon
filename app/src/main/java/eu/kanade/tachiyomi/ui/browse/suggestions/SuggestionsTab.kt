@@ -33,7 +33,7 @@ fun Screen.suggestionsTab(): TabContent {
     val state by viewModel.state.collectAsStateWithLifecycle()
 
     return TabContent(
-        titleRes = MR.strings.label_suggestions,
+        titleRes = MR.strings.label_discover,
         actions = listOf(
             AppBar.Action(
                 title = stringResource(MR.strings.action_webview_refresh),

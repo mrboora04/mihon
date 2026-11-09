@@ -62,6 +62,12 @@ class SuggestionPreferences(
         0L,
     )
 
+    /** Failed MangaUpdates requests since the last success, for [ForYouLimiter]'s backoff. */
+    val failuresInARow: Preference<Int> = preferenceStore.getInt(
+        Preference.appStateKey("for_you_failures_in_a_row"),
+        0,
+    )
+
     /** Why requests were paused, shown with the pause message. */
     val pauseReason: Preference<String> = preferenceStore.getString(
         Preference.appStateKey("for_you_pause_reason"),

@@ -23,12 +23,12 @@ Discover and read manga, webtoons, comics, and more – easier than ever on your
 
 ## What this fork is for
 
-Mihon is good at reading what you already know about, but it doesn't help you find what to read next. This fork adds that: **Browse → For you**, a tab that suggests manga **not in your library** based on what you actually read, and says why it picked each one.
+Mihon is good at reading what you already know about, but it doesn't help you find what to read next. This fork adds that: **Browse → Discover**, a tab that suggests manga **not in your library** based on what you actually read, and says why it picked each one.
 
 - **For you:** what other readers recommend for titles you finished, are reading or have saved, plus picks from your recent searches ("Because you read Kingdom", "Because you searched Frieren").
 - **Trending:** what's popular this week, month or 3 months.
 - **Top rated:** the best rated in your genres, or in one of your favourite categories.
-- **Hashtags on every pick** (`#finished`, `#readers-pick`, `#same-author`, `#action`…), so you can see the reason and filter by it.
+- **One line on every card saying why** ("Because you read Kingdom", "#3 on MangaUpdates this week"), and **hashtag filters** at the top (`#finished`, `#readers-pick`, `#same-author`, `#action`…).
 - **Settings → Personalised** to choose what it's based on.
 
 **How it stays polite:** recommendations come from [MangaUpdates](https://www.mangaupdates.com)' public data (no login needed), not from scraping manga sites. Sites are only searched when you tap a title. MangaUpdates is asked at most 30 times an hour, a few at a time, and answers are saved for a day or a week. Novels and doujinshi are left out.

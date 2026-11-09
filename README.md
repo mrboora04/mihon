@@ -19,9 +19,23 @@ Discover and read manga, webtoons, comics, and more – easier than ever on your
 <div align="left">
 
 > [!NOTE]
-> **Personal fork, not an official Mihon release.** It adds **Browse → For you**: recommendations from [MangaUpdates](https://www.mangaupdates.com) based on what you read, finish and search, plus **Trending** (week / month / 3 months) and **Top rated** lists. Each pick shows hashtags saying why.
->
-> Manga sites are only searched when you tap a title. MangaUpdates is asked at most 30 times an hour, with answers cached. Settings live in **Settings → Personalised**. Test builds are under [Releases](../../releases).
+> **Personal fork, not an official Mihon release.**
+
+## What this fork is for
+
+Mihon is good at reading what you already know about, but it doesn't help you find what to read next. This fork adds that: **Browse → For you**, a tab that suggests manga **not in your library** based on what you actually read, and says why it picked each one.
+
+- **For you:** what other readers recommend for titles you finished, are reading or have saved, plus picks from your recent searches ("Because you read Kingdom", "Because you searched Frieren").
+- **Trending:** what's popular this week, month or 3 months.
+- **Top rated:** the best rated in your genres, or in one of your favourite categories.
+- **Hashtags on every pick** (`#finished`, `#readers-pick`, `#same-author`, `#action`…), so you can see the reason and filter by it.
+- **Settings → Personalised** to choose what it's based on.
+
+**How it stays polite:** recommendations come from [MangaUpdates](https://www.mangaupdates.com)' public data (no login needed), not from scraping manga sites. Sites are only searched when you tap a title. MangaUpdates is asked at most 30 times an hour, a few at a time, and answers are saved for a day or a week. Novels and doujinshi are left out.
+
+**Where it's going:** this is a personal build for now. The plan is to offer the useful parts to Mihon as small, separate pull requests ([recommendations request: #646](https://github.com/mihonapp/mihon/issues/646)).
+
+Code: the [`feature/browse-suggestions`](../../tree/feature/browse-suggestions) branch. Test builds: [Releases](../../releases).
 
 </div>
 
